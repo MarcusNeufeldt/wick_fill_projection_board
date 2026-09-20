@@ -1,0 +1,29 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local configuration and logs
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+*.bak
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Reproducible market data, trained artifacts, and generated analysis output
+/data/*
+!/data/.gitkeep
+/conditional-wick-path-dashboard.html
+/wick-fill-projection.html
+/wick-fill-scenario-chart.html
+/wick-fill-projection.png
+
+# Local Rust prototype (kept out of this repository)
+/rust_jev_projection/
