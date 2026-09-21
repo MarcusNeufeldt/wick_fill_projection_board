@@ -44,8 +44,9 @@ python .\build_native_runtime_cache.py --timeframe 1m --asset ETHUSDT
 - `build_conditional_path_scenarios.py` — Fast / Normal / Extreme real-path selector.
 - `build_conditional_path_library.py` — completed strict-wick episode library builder.
 - `train_conditional_wick_v2.py` — optional conditional risk-quantile layer.
+- `train_neural_path_v3.py` — isolated GPU-capable sequence-learning and real-path retrieval challenger.
 - `evaluate_conditional_path_replay.py` and `verify_conditional_path_engine.py` — replay and integrity checks.
-- `CONDITIONAL_PATH_ENGINE.md`, `LIVE_DASHBOARD.md`, and `V2_CALIBRATION.md` — method and operating notes.
+- `CONDITIONAL_PATH_ENGINE.md`, `LIVE_DASHBOARD.md`, `V2_CALIBRATION.md`, and `NEURAL_PATH_V3.md` — method and operating notes.
 
 ## Recorded empirical observations
 
@@ -63,4 +64,5 @@ With the local data artifacts available:
 python -m py_compile .\serve_conditional_wick_dashboard.py .\refresh_futures_klines.py .\build_conditional_path_scenarios.py .\train_conditional_wick_v2.py
 python .\verify_conditional_path_engine.py
 python .\verify_live_refresh_service.py
+.venv\Scripts\python.exe -m unittest -v test_neural_path_v3.py
 ```

@@ -1,0 +1,6 @@
+-r requirements.txt
+scikit-learn>=1.5,<2
+
+# Install the CUDA build separately on NVIDIA Windows machines, for example:
+# uv pip install --python .venv\Scripts\python.exe torch==2.13.0+cu130 \
+#   --index-url https://download.pytorch.org/whl/cu130
