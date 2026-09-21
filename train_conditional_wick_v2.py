@@ -2,14 +2,14 @@
 
 V2 is a risk layer for the existing V1 real-historical-trajectory selector.  It
 does not alter V1, estimate an unconditional fill probability, or claim a
-trading edge.  Its population is deliberately restricted to 5-minute ETHUSDT
-and BTCUSDT strict-wick episodes that eventually made the library's clean fill.
+trading edge. Its population is deliberately restricted to configured 5-minute
+strict-wick episodes that eventually made the library's clean fill.
 
 For each observable post-signal snapshot, the prototype builds only state that
 would have been known when that candle closed, then estimates conditional
-quantiles for remaining bars to fill and maximum away-from-wick movement through
-the eventual fill.  The latter includes the snapshot candle, matching V1's
-existing ``future_peak_move_pct`` replay definition.
+quantiles for remaining bars to fill and maximum away-from-wick movement after
+the snapshot through the eventual fill. The latter uses the same future
+candle-envelope window as the displayed V1 paths.
 """
 
 from __future__ import annotations
@@ -26,8 +26,19 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from conditional_wick_assets import (
+    ASSET_CATEGORICAL_FEATURE_COLUMNS,
+    SUPPORTED_ASSETS,
+    asset_indicator_column,
+    default_library_dir,
+)
 
 QUANTILES = (0.10, 0.50, 0.90)
+MODEL_SCHEMA_VERSION = "2.1.0-multi-asset"
+FUTURE_AWAY_TARGET_SEMANTICS = (
+    "maximum direction-normalized candle-envelope move away from the wick after the snapshot "
+    "through the terminal fill candle, matching V1 displayed-path semantics"
+)
 STATIC_FEATURE_COLUMNS = (
     "body_pct_of_range",
     "dominant_wick_pct_of_range",
@@ -49,7 +60,7 @@ SNAPSHOT_FEATURE_COLUMNS = (
     "log_volume_ratio_to_signal",
     *STATIC_FEATURE_COLUMNS,
 )
-CATEGORICAL_FEATURE_COLUMNS = ("asset_is_btc", "direction_is_lower")
+CATEGORICAL_FEATURE_COLUMNS = (*ASSET_CATEGORICAL_FEATURE_COLUMNS, "direction_is_lower")
 DEFAULT_SNAPSHOT_OFFSETS = "1,3,6,12,24,60,120,240,480,960"
 OBSERVABLE_STATE_INPUT_COLUMNS = (
     "elapsed_bars",
@@ -118,10 +129,10 @@ def observable_state_schema() -> dict[str, Any]:
         "volume_ratio_to_signal": "non-negative snapshot-candle volume divided by signal-candle volume",
     }
     return {
-        "schema_version": "2.0.0-prototype",
+        "schema_version": MODEL_SCHEMA_VERSION,
         "input_shape": "a JSON object or {\"state\": object}",
         "required_categorical_fields": {
-            "asset": ["ETHUSDT", "BTCUSDT"],
+            "asset": list(SUPPORTED_ASSETS),
             "direction": ["upper_wick", "lower_wick"],
         },
         "required_numeric_fields": [
@@ -131,7 +142,7 @@ def observable_state_schema() -> dict[str, Any]:
         "derived_inside_v2": {
             "elapsed_log_bars": "log1p(elapsed_bars)",
             "log_volume_ratio_to_signal": "log1p(volume_ratio_to_signal)",
-            "asset_is_btc": "asset == BTCUSDT",
+            **{asset_indicator_column(asset): f"asset == {asset}" for asset in SUPPORTED_ASSETS},
             "direction_is_lower": "direction == lower_wick",
         },
         "output": {
@@ -167,6 +178,7 @@ def load_events(library_dir: Path) -> pd.DataFrame:
         "signal_open_time_ms",
         "fill_open_time_utc",
         "interval_minutes",
+        "signal_to_departure_bars",
         "signal_to_fill_bars",
         "signal_volume",
         *STATIC_FEATURE_COLUMNS,
@@ -174,13 +186,14 @@ def load_events(library_dir: Path) -> pd.DataFrame:
     missing = sorted(required.difference(events.columns))
     if missing:
         raise RuntimeError(f"episodes.csv is missing required V2 columns: {', '.join(missing)}")
-    events = events.loc[
-        events["timeframe"].eq("5m") & events["asset"].isin(("ETHUSDT", "BTCUSDT"))
-    ].copy()
+    events = events.loc[events["timeframe"].eq("5m") & events["asset"].isin(SUPPORTED_ASSETS)].copy()
     if events.empty:
-        raise RuntimeError("No 5m ETHUSDT/BTCUSDT completed clean-fill episodes are available")
+        raise RuntimeError(f"No 5m {'/'.join(SUPPORTED_ASSETS)} completed clean-fill episodes are available")
     events["signal_open_time_ms"] = pd.to_numeric(events["signal_open_time_ms"], errors="raise").astype("int64")
     events["interval_minutes"] = pd.to_numeric(events["interval_minutes"], errors="raise").astype("int64")
+    events["signal_to_departure_bars"] = pd.to_numeric(
+        events["signal_to_departure_bars"], errors="raise"
+    ).astype("int64")
     events["signal_to_fill_bars"] = pd.to_numeric(events["signal_to_fill_bars"], errors="raise").astype("int64")
     events["direction_sign"] = pd.to_numeric(events["direction_sign"], errors="raise").astype("int64")
     events["fill_close_time_ms"] = (
@@ -233,6 +246,7 @@ def build_snapshot_dataset(events: pd.DataFrame, paths: pd.DataFrame, offsets: l
         "signal_open_time_ms",
         "fill_close_time_ms",
         "interval_minutes",
+        "signal_to_departure_bars",
         "signal_to_fill_bars",
         "signal_volume",
         *STATIC_FEATURE_COLUMNS,
@@ -274,7 +288,7 @@ def build_snapshot_dataset(events: pd.DataFrame, paths: pd.DataFrame, offsets: l
     work["elapsed_log_bars"] = np.log1p(work["offset_bars"].to_numpy(dtype=float))
     work["remaining_bars"] = work["signal_to_fill_bars"] - work["offset_bars"]
     work["future_max_away_pct"] = groups["directional_peak_at_bar"].transform(
-        lambda values: values.iloc[::-1].cummax().iloc[::-1]
+        lambda values: values.iloc[::-1].cummax().iloc[::-1].shift(-1)
     )
     work["snapshot_open_time_ms"] = (
         work["signal_open_time_ms"] + work["offset_bars"] * work["interval_minutes"] * 60_000
@@ -282,14 +296,19 @@ def build_snapshot_dataset(events: pd.DataFrame, paths: pd.DataFrame, offsets: l
     work["snapshot_close_time_ms"] = (
         work["snapshot_open_time_ms"] + work["interval_minutes"] * 60_000
     ).astype("int64")
-    work["asset_is_btc"] = work["asset"].eq("BTCUSDT").astype(float)
+    for asset in SUPPORTED_ASSETS:
+        work[asset_indicator_column(asset)] = work["asset"].eq(asset).astype(float)
     work["direction_is_lower"] = work["direction"].eq("lower_wick").astype(float)
 
-    selected = work.loc[
+    observable_before_departure_filter = (
         work["offset_bars"].isin(offsets)
         & work["remaining_bars"].gt(0)
         & work["current_move_pct"].gt(0)
-    ].copy()
+    )
+    observable_after_departure_filter = observable_before_departure_filter & work["offset_bars"].ge(
+        work["signal_to_departure_bars"]
+    )
+    selected = work.loc[observable_after_departure_filter].copy()
     required_numeric = [
         *SNAPSHOT_FEATURE_COLUMNS,
         *CATEGORICAL_FEATURE_COLUMNS,
@@ -303,7 +322,9 @@ def build_snapshot_dataset(events: pd.DataFrame, paths: pd.DataFrame, offsets: l
     selected = selected.sort_values(["snapshot_close_time_ms", "episode_id", "offset_bars"], kind="stable").reset_index(drop=True)
     return selected, {
         "path_rows_through_fill": int(len(work)),
-        "snapshot_rows_before_finite_filter": int((work["offset_bars"].isin(offsets) & work["remaining_bars"].gt(0) & work["current_move_pct"].gt(0)).sum()),
+        "snapshot_rows_before_departure_filter": int(observable_before_departure_filter.sum()),
+        "snapshot_rows_after_departure_filter": int(observable_after_departure_filter.sum()),
+        "snapshot_rows_before_finite_filter": int(observable_after_departure_filter.sum()),
         "snapshot_rows_after_finite_filter": int(len(selected)),
     }
 
@@ -365,15 +386,19 @@ def robust_feature_matrix(frame: pd.DataFrame, centers: np.ndarray | None = None
         scales = np.where(scales > 1e-12, scales, np.where(fallback > 1e-12, fallback, 1.0))
     transformed_numeric = np.clip((numeric - centers) / scales, -12.0, 12.0)
     categories = frame.loc[:, CATEGORICAL_FEATURE_COLUMNS].to_numpy(dtype=float)
-    # These fixed penalties preserve asset/direction conditioning without forbidding cross-asset analogues outright.
-    transformed_categories = categories * np.asarray((1.75, 1.25), dtype=float)
+    # Full one-hot asset indicators keep every different-asset pair at the same
+    # 1.75 Euclidean penalty while still allowing cross-asset analogues.
+    asset_weight = 1.75 / np.sqrt(2.0)
+    transformed_categories = categories * np.asarray(
+        [asset_weight] * len(ASSET_CATEGORICAL_FEATURE_COLUMNS) + [1.25], dtype=float
+    )
     return np.ascontiguousarray(np.hstack((transformed_numeric, transformed_categories)), dtype=np.float32), centers, scales
 
 
 def fit_local_quantile_model(train: pd.DataFrame) -> dict[str, Any]:
     matrix, centers, scales = robust_feature_matrix(train)
     return {
-        "schema_version": "2.0.0-prototype",
+        "schema_version": MODEL_SCHEMA_VERSION,
         "estimator": "robust-scaled weighted nearest-neighbour empirical conditional quantiles",
         "numeric_feature_columns": list(SNAPSHOT_FEATURE_COLUMNS),
         "categorical_feature_columns": list(CATEGORICAL_FEATURE_COLUMNS),
@@ -431,8 +456,8 @@ def observable_state_frame(state: dict[str, Any]) -> pd.DataFrame:
         raise ValueError(f"Observable state is missing required fields: {', '.join(missing)}")
     asset = str(state["asset"])
     direction = str(state["direction"])
-    if asset not in {"ETHUSDT", "BTCUSDT"}:
-        raise ValueError("asset must be ETHUSDT or BTCUSDT")
+    if asset not in SUPPORTED_ASSETS:
+        raise ValueError(f"asset must be one of {'/'.join(SUPPORTED_ASSETS)}")
     if direction not in {"upper_wick", "lower_wick"}:
         raise ValueError("direction must be upper_wick or lower_wick")
     values: dict[str, float] = {}
@@ -452,7 +477,7 @@ def observable_state_frame(state: dict[str, Any]) -> pd.DataFrame:
     row = {
         "elapsed_log_bars": float(np.log1p(values.pop("elapsed_bars"))),
         "log_volume_ratio_to_signal": float(np.log1p(values.pop("volume_ratio_to_signal"))),
-        "asset_is_btc": float(asset == "BTCUSDT"),
+        **{asset_indicator_column(candidate): float(asset == candidate) for candidate in SUPPORTED_ASSETS},
         "direction_is_lower": float(direction == "lower_wick"),
         **values,
     }
@@ -467,7 +492,7 @@ def load_model_bundle(path: Path) -> dict[str, Any]:
     missing = sorted(required.difference(model)) if isinstance(model, dict) else ["model dictionary"]
     if missing:
         raise ValueError(f"Invalid V2 model bundle: missing {', '.join(missing)}")
-    if model["schema_version"] != "2.0.0-prototype":
+    if model["schema_version"] != MODEL_SCHEMA_VERSION:
         raise ValueError(f"Unsupported V2 model schema: {model['schema_version']}")
     return model
 
@@ -483,14 +508,14 @@ def predict_from_observable_state(
     remaining, away = predict_quantiles(model, row, requested_neighbors)
     labels = ("p10", "p50", "p90")
     return {
-        "schema_version": "2.0.0-prototype",
+        "schema_version": MODEL_SCHEMA_VERSION,
         "conditional_population": model.get("population", "clean eventual-fill episodes only"),
         "neighbors": min(requested_neighbors, int(len(model["x_train"]))),
         "quantiles": {
             "remaining_bars": {label: round(float(remaining[0, index]), 6) for index, label in enumerate(labels)},
             "future_max_away_pct": {label: round(float(away[0, index]), 6) for index, label in enumerate(labels)},
         },
-        "target_semantics": "future_max_away_pct includes the observed snapshot candle, matching V1 replay semantics",
+        "target_semantics": FUTURE_AWAY_TARGET_SEMANTICS,
         "warning": "Conditional clean-fill risk quantiles, not unconditional fill probability or predictive-edge evidence.",
     }
 
@@ -507,7 +532,7 @@ def observable_state_payload_from_snapshot(row: pd.Series) -> dict[str, Any]:
         if name not in state:
             state[name] = float(row[name])
     return {
-        "schema_version": "2.0.0-prototype",
+        "schema_version": MODEL_SCHEMA_VERSION,
         "note": "Example observable snapshot contract from a chronological holdout row. It contains no target labels.",
         "state": state,
     }
@@ -590,23 +615,23 @@ def markdown_report(summary: dict[str, Any]) -> str:
             "",
             "## Scope and target",
             "",
-            "- Population: only 5m ETHUSDT/BTCUSDT strict-wick episodes that eventually made the library's clean fill. This is **not** an unconditional fill probability.",
-            "- Snapshot features use signal-time fields plus completed candles up to the snapshot close. Labels are remaining bars and maximum direction-normalized move away from the wick through the fill (including the observed snapshot candle, matching V1 replay semantics).",
+            f"- Population: only 5m {'/'.join(SUPPORTED_ASSETS)} strict-wick episodes that eventually made the library's clean fill. This is **not** an unconditional fill probability.",
+            "- Snapshot features use signal-time fields plus completed candles up to the snapshot close. Labels are subsequent bars to the fill and the maximum direction-normalized candle-envelope move away after the snapshot through the terminal fill candle, matching V1 displayed-path semantics.",
             "",
             "## Limitations",
             "",
             "- Conditional calibration on historical clean fills is not predictive-edge evidence and excludes no-fill, invalidated, and censored signals.",
             "- The local empirical quantiles are a transparent baseline; calibration can drift by regime, asset, direction, and sparse long-duration states.",
-            "- V2 has no live selector, UI, or position-sizing integration. Treat the JSON/CSV as a risk diagnostic beside V1 paths.",
+            "- The local dashboard may display this optional static-artifact diagnostic beside V1 routes; it never retrains V2, alters V1 route selection, or supplies a position-sizing rule.",
             "",
             "## Later live-display interface",
             "",
             "- `python train_conditional_wick_v2.py --print-input-schema` prints the required observable-state JSON contract.",
             f"- `python train_conditional_wick_v2.py --predict-json {summary['artifact_paths']['example_observable_state_json']} --model-path {summary['artifact_paths']['model_pickle']}` emits one quantile response without retraining.",
-            "- Python callers can use `load_model_bundle(path)` and `predict_from_observable_state(model, state)` from this script; no server wiring is included.",
+            "- Python callers can use `load_model_bundle(path)` and `predict_from_observable_state(model, state)` from this script; dashboard use is optional and artifact-backed rather than live retraining.",
             "",
-            f"Machine-readable summary: `{summary['artifact_paths']['summary_json']}`  ",
-            f"Holdout predictions: `{summary['artifact_paths']['holdout_predictions_csv']}`  ",
+            f"Machine-readable summary: `{summary['artifact_paths']['summary_json']}`",
+            f"Holdout predictions: `{summary['artifact_paths']['holdout_predictions_csv']}`",
             f"Reusable local model bundle: `{summary['artifact_paths']['model_pickle']}`",
             "",
         ]
@@ -616,8 +641,8 @@ def markdown_report(summary: dict[str, Any]) -> str:
 def main() -> None:
     root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--library-dir", type=Path, default=root / "data" / "conditional_path_library_5y")
-    parser.add_argument("--output-dir", type=Path, default=root / "data" / "conditional_path_library_5y" / "v2_models")
+    parser.add_argument("--library-dir", type=Path, default=default_library_dir(root))
+    parser.add_argument("--output-dir", type=Path, default=default_library_dir(root) / "v2_models")
     parser.add_argument("--markdown-output", type=Path, default=root / "V2_CALIBRATION.md")
     parser.add_argument("--model-path", type=Path, help="Existing V2 pickle used with --predict-json")
     parser.add_argument("--holdout-months", type=int, default=12)
@@ -721,14 +746,14 @@ def main() -> None:
     predictions_path = output_dir / "conditional_wick_v2_holdout_predictions.csv"
     example_state_path = output_dir / "conditional_wick_v2_example_observable_state.json"
     summary: dict[str, Any] = {
-        "schema_version": "2.0.0-prototype",
+        "schema_version": MODEL_SCHEMA_VERSION,
         "generated_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "purpose": "Leakage-safe V2 conditional risk quantiles beside V1 historical trajectories; not a fill-probability or trading-edge claim.",
-        "conditional_population": "Only completed 5m ETHUSDT/BTCUSDT strict-wick episodes that eventually made the library clean fill; no-fill, invalidated, and censored signals are out of population.",
+        "conditional_population": f"Only completed 5m {'/'.join(SUPPORTED_ASSETS)} strict-wick episodes that eventually made the library clean fill; no-fill, invalidated, and censored signals are out of population.",
         "estimator": model["estimator"],
         "targets": {
-            "remaining_bars": "5m bars from the snapshot candle to the eventual clean fill candle",
-            "future_max_away_pct": "maximum direction-normalized move away from the wick across the snapshot candle through the eventual fill, matching V1 replay semantics",
+            "remaining_bars": "subsequent 5m bars after the snapshot candle through the eventual clean fill candle",
+            "future_max_away_pct": FUTURE_AWAY_TARGET_SEMANTICS,
         },
         "quantiles": list(QUANTILES),
         "snapshot_feature_columns": list(SNAPSHOT_FEATURE_COLUMNS),
@@ -737,11 +762,12 @@ def main() -> None:
             "callable": "load_model_bundle(path) then predict_from_observable_state(model, state, neighbors=None)",
             "cli": "python train_conditional_wick_v2.py --predict-json state.json --model-path conditional_wick_v2_model.pkl",
             "input_schema": observable_state_schema(),
-            "server_integration": "none; this is a standalone artifact contract for a later display layer",
+            "server_integration": "optional local dashboard diagnostic; source refresh does not rebuild or retrain this static artifact",
         },
         "chronological_split": split,
         "data": {
-            "asset_timeframe": "ETHUSDT/BTCUSDT 5m",
+            "asset_timeframe": f"{'/'.join(SUPPORTED_ASSETS)} 5m",
+            "asset_universe": list(SUPPORTED_ASSETS),
             "clean_fill_episode_count": int(len(events)),
             "signal_start_utc": utc_iso(int(events["signal_open_time_ms"].min())),
             "signal_end_utc": utc_iso(int(events["signal_open_time_ms"].max())),
@@ -758,7 +784,7 @@ def main() -> None:
         "limitations": [
             "Conditional clean-fill calibration is not an unconditional fill probability and does not establish predictive edge.",
             "The estimator is intentionally local and historical; regime drift and sparse long-duration states can degrade calibration.",
-            "V2 does not replace V1 selected real candle paths and is not wired into a UI, server, or sizing rule.",
+            "V2 does not replace V1 selected real candle paths; the optional local dashboard only reads a static artifact and never uses it for sizing.",
         ],
         "artifact_paths": {
             "summary_json": str(summary_path),

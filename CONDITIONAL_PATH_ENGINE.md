@@ -31,8 +31,8 @@ Each historical episode is direction-normalised so that positive distance means 
 - short-horizon volatility and return context.
 
 Before the engine will project a live path, price must also have made the
-same confirmed departure used by the historical definition: a later close
-beyond the signal's opposite extreme. A merely unfilled wick is not enough.
+same confirmed departure used by the historical definition: a later close at
+or beyond the signal's opposite extreme. A merely unfilled wick is not enough.
 
 The path selection must update after every newly closed candle. A path that matched at signal time may cease to be relevant after a large live move-away.
 
@@ -46,7 +46,7 @@ The displayed screen must state when it is showing a **conditional fill scenario
 
 The immediate training library is:
 
-- Binance USD-M perpetual `BTCUSDT` and `ETHUSDT`;
+- Binance USD-M perpetual `ETHUSDT`, `BTCUSDT`, `SOLUSDT`, `UNIUSDT`, and `NEARUSDT`;
 - five years of completed 5-minute OHLCV candles;
 - 15-minute bars derived from the aligned 5-minute source;
 - strict upper- and lower-wick signal episodes;
@@ -89,10 +89,11 @@ and pinned strict-wick timestamp, validates that the wick is still unfilled
 and has departed, then renders the three historical candle paths on a
 TradingView Lightweight Charts view.
 
-The server uses a verified five-year local snapshot and caches completed
-requests. It deliberately does **not** silently fetch exchange data or claim
-that a browser page is continuously live. An explicit incremental source-data
-refresh and library rebuild are the next operational layer.
+The server uses a verified five-year local snapshot, caches completed
+requests, and atomically checks for completed source candles on its configured
+one-minute cadence. The episode library and V2 artifact remain static until
+an explicit rebuild, so source refresh is live-price maintenance rather than
+silent model retraining.
 
 ## Dashboard contract
 
@@ -108,15 +109,14 @@ For a pinned signal the dashboard must show:
 
 The existing `rust_jev_projection` dashboard is an adjacent generic close-return forecaster with conformal bands. It is preserved as a separate experiment; it is not yet the wick-conditioned engine specified here.
 
-Until the explicit refresh layer exists, the live-update requirement is
-intentionally a pending contract item rather than a claim about the current
-browser service.
+The live-update requirement applies to completed source candles and route
+recalculation. It does not imply a five-minute library rebuild or V2 retrain.
 
 ## Validation contract
 
 The path engine is evaluated with chronological replay, not a random split:
 
-1. At a past signal/state time T, construct its cohort from episodes completed before T only.
+1. At a past signal/state time T, construct its cohort from episodes whose terminal fill candle had closed at or before T.
 2. Generate the three scenarios and interval statistics using only that historical library.
 3. Reveal the actual subsequent path.
 4. Score time-to-fill quantile calibration, adverse-excursion coverage, path-envelope coverage, and a baseline comparison.
@@ -126,9 +126,27 @@ The correct success criterion is calibrated risk/time coverage, not a visually c
 
 ## Immediate build milestones
 
-1. Download and validate five-year BTCUSDT and ETHUSDT 5-minute source data without replacing the existing three-year study.
+1. Download and validate five-year BTCUSDT, ETHUSDT, SOLUSDT, UNIUSDT, and NEARUSDT 5-minute source data without replacing the existing three-year study.
 2. Generate a multi-asset, direction-normalised completed-episode library with state snapshots and normalized OHLC paths.
 3. Build a reusable three-scenario selector and JSON contract for a pinned signal/state.
 4. Render the three scenarios in a local TradingView Lightweight Charts prototype.
 5. Add chronological replay tests for scenario coverage before calling the dashboard predictive.
 6. Add the separate local pin-and-project service, then add an auditable incremental refresh loop and V2 calibrated risk outputs.
+
+## Corrected V1 baseline
+
+- Candidate episodes are available only after their **terminal fill candle has
+  closed at or before the current observation snapshot closes**. This is the
+  same rule in the live selector and chronological replay.
+- Historical alignment states must be post-departure: the alignment offset is
+  at or after the recorded departure bar and before the fill bar.
+- Fast, Normal, and Extreme are selected after each analogue's future
+  excursion has been rescaled into the pinned wick's live coordinates. The
+  older historical-coordinate excursion remains a separate field.
+- The displayed future-risk window begins after the current snapshot and
+  includes the terminal fill candle. The dashboard reports both its peak
+  distance from the wick target and its additional adverse movement from the
+  current close.
+- This is a five-minute OHLC candle-envelope convention. If a terminal candle
+  both touches the wick and makes an extreme, its intrabar order is unknown
+  without finer data.

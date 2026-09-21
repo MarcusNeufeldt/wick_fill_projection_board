@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,9 +32,10 @@ from download_futures_klines import (
     request_json,
     utc_iso,
 )
+from conditional_wick_assets import SUPPORTED_ASSETS
 
 
-DEFAULT_SYMBOLS = ("ETHUSDT", "BTCUSDT")
+DEFAULT_SYMBOLS = SUPPORTED_ASSETS
 
 
 @dataclass(frozen=True)
@@ -162,6 +164,18 @@ def _validated_append_rows(
     return rows
 
 
+def _replace_with_retry(temporary: Path, destination: Path, attempts: int = 6) -> None:
+    """Retry a Windows sharing violation without weakening the atomic-swap contract."""
+    for attempt in range(attempts):
+        try:
+            os.replace(temporary, destination)
+            return
+        except PermissionError:
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(0.15 * (attempt + 1))
+
+
 def _append_rows_atomically(path: Path, rows: Sequence[Sequence[str]]) -> None:
     """Copy the verified source, append rows, and replace it in one operation."""
 
@@ -181,7 +195,7 @@ def _append_rows_atomically(path: Path, rows: Sequence[Sequence[str]]) -> None:
             if needs_newline:
                 destination.write("\n")
             csv.writer(destination).writerows(rows)
-        os.replace(temporary, path)
+        _replace_with_retry(temporary, path)
     finally:
         if temporary.exists():
             temporary.unlink(missing_ok=True)
@@ -194,7 +208,7 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     temporary = Path(temporary_name)
     try:
         temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(temporary, path)
+        _replace_with_retry(temporary, path)
     finally:
         if temporary.exists():
             temporary.unlink(missing_ok=True)

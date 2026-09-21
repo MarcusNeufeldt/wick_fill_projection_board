@@ -24,7 +24,10 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
+from conditional_wick_assets import SUPPORTED_ASSETS, default_library_dir
 
+
+ONE_MINUTE_MS = 60 * 1000
 FIVE_MINUTES_MS = 5 * 60 * 1000
 FIFTEEN_MINUTES_MS = 15 * 60 * 1000
 BODY_MAX_PCT = 0.05
@@ -75,7 +78,7 @@ def atomic_write_csv(path: Path, frame: pd.DataFrame) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def read_five_minute_file(path: Path) -> pd.DataFrame:
+def read_candle_file(path: Path, interval_ms: int) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Missing raw candle file: {path}")
     frame = pd.read_csv(path)
@@ -91,9 +94,17 @@ def read_five_minute_file(path: Path) -> pd.DataFrame:
     if frame["open_time"].duplicated().any():
         raise RuntimeError(f"{path} contains duplicate candle timestamps")
     deltas = np.diff(frame["open_time"].to_numpy(dtype=np.int64))
-    if len(deltas) and not np.all(deltas == FIVE_MINUTES_MS):
-        raise RuntimeError(f"{path} contains a gap or non-5m timestamp")
+    if len(deltas) and not np.all(deltas == interval_ms):
+        raise RuntimeError(f"{path} contains a gap or unexpected timestamp interval")
     return frame
+
+
+def read_five_minute_file(path: Path) -> pd.DataFrame:
+    return read_candle_file(path, FIVE_MINUTES_MS)
+
+
+def read_one_minute_file(path: Path) -> pd.DataFrame:
+    return read_candle_file(path, ONE_MINUTE_MS)
 
 
 def restrict_to_common_window(frames: dict[str, pd.DataFrame]) -> tuple[dict[str, pd.DataFrame], int, int]:
@@ -139,7 +150,9 @@ def resample_to_fifteen_minutes(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def detect_strict_signals(frame: pd.DataFrame, asset: str, timeframe: str) -> pd.DataFrame:
-    interval_ms = FIVE_MINUTES_MS if timeframe == "5m" else FIFTEEN_MINUTES_MS
+    interval_ms = {"1m": ONE_MINUTE_MS, "5m": FIVE_MINUTES_MS, "15m": FIFTEEN_MINUTES_MS}.get(timeframe)
+    if interval_ms is None:
+        raise ValueError(f"Unsupported strict-signal timeframe: {timeframe}")
     interval_minutes = interval_ms // 60_000
     bars_per_hour = 60 // interval_minutes
     value = frame.copy()
@@ -182,7 +195,13 @@ def detect_strict_signals(frame: pd.DataFrame, asset: str, timeframe: str) -> pd
     value["aligned_prior_1h_return_pct"] = value["direction_sign"] * value["prior_1h_return_pct"]
     value["wick_target"] = np.where(value["direction"] == "lower_wick", value["low"], value["high"])
     value["opposite_extreme"] = np.where(value["direction"] == "lower_wick", value["high"], value["low"])
-    signals = value.loc[(value["direction_sign"] != 0) & value[FEATURE_COLUMNS].notna().all(axis=1)].copy()
+    finite_features = pd.Series(
+        np.isfinite(value[FEATURE_COLUMNS].to_numpy(dtype=float)).all(axis=1),
+        index=value.index,
+    )
+    signals = value.loc[
+        (value["direction_sign"] != 0) & value[FEATURE_COLUMNS].notna().all(axis=1) & finite_features
+    ].copy()
     signals["asset"] = asset
     signals["timeframe"] = timeframe
     signals["interval_minutes"] = interval_minutes
@@ -415,7 +434,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--eth-5m", type=Path, default=root / "data" / "ETHUSDT_5m_5y.csv")
     parser.add_argument("--btc-5m", type=Path, default=root / "data" / "BTCUSDT_5m_5y.csv")
-    parser.add_argument("--out-dir", type=Path, default=root / "data" / "conditional_path_library_5y")
+    parser.add_argument("--sol-5m", type=Path, default=root / "data" / "SOLUSDT_5m_5y.csv")
+    parser.add_argument("--uni-5m", type=Path, default=root / "data" / "UNIUSDT_5m_5y.csv")
+    parser.add_argument("--near-5m", type=Path, default=root / "data" / "NEARUSDT_5m_5y.csv")
+    parser.add_argument("--out-dir", type=Path, default=default_library_dir(root))
     parser.add_argument(
         "--max-fill-days",
         type=int,
@@ -426,7 +448,15 @@ def main() -> None:
     if args.max_fill_days < 1:
         parser.error("--max-fill-days must be positive")
 
-    source_paths = {"ETHUSDT": args.eth_5m.resolve(), "BTCUSDT": args.btc_5m.resolve()}
+    source_paths = {
+        "ETHUSDT": args.eth_5m.resolve(),
+        "BTCUSDT": args.btc_5m.resolve(),
+        "SOLUSDT": args.sol_5m.resolve(),
+        "UNIUSDT": args.uni_5m.resolve(),
+        "NEARUSDT": args.near_5m.resolve(),
+    }
+    if tuple(source_paths) != SUPPORTED_ASSETS:
+        raise RuntimeError("Configured source paths do not match the supported asset universe")
     raw: dict[str, pd.DataFrame] = {}
     for asset, path in source_paths.items():
         print(json.dumps({"stage": "read_source", "asset": asset}), flush=True)

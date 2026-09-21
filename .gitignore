@@ -27,3 +27,4 @@ Thumbs.db
 
 # Local Rust prototype (kept out of this repository)
 /rust_jev_projection/
+/native_wick_matcher/target/

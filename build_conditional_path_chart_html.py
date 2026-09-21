@@ -149,35 +149,34 @@ HTML = r'''<!doctype html>
       };
       const berlin = seconds => new Intl.DateTimeFormat('en-GB', {timeZone:'Europe/Berlin', day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit', hour12:false}).format(new Date(seconds * 1000));
       const current = data.current_state;
+      const cohortFutureMove = data.cohort_distribution.projected_future_max_away_move_pct;
       document.getElementById('title').textContent = `${data.pinned_signal.asset} ${data.pinned_signal.timeframe} / ${data.pinned_signal.direction.replace('_', ' ')}`;
       document.getElementById('signal-time').textContent = `Pinned: ${data.pinned_signal.signal_open_time_utc.replace('T',' ').replace('Z',' UTC')}`;
-      document.getElementById('source-window').textContent = `${data.library.same_timeframe_trajectory_candidates_before_signal.toLocaleString()} resolved ${data.pinned_signal.timeframe} episodes available before this signal`;
+      document.getElementById('source-window').textContent = `${data.library.same_timeframe_trajectory_candidates_before_snapshot.toLocaleString()} resolved ${data.pinned_signal.timeframe} episodes available at the observation snapshot`;
       document.getElementById('target').textContent = money(data.pinned_signal.wick_target);
       document.getElementById('latest').textContent = money(current.as_of_close);
       document.getElementById('current-distance').textContent = pct(current.current_move_pct);
       document.getElementById('peak-distance').textContent = pct(current.peak_move_pct);
       document.getElementById('elapsed').textContent = `${(current.elapsed_minutes / 1440).toFixed(1)}d`;
-      document.getElementById('cohort-note').textContent = `Top ${data.library.top_k_state_matched_episodes} closest states · P50 remaining ${Math.round(data.cohort_distribution.remaining_time_to_fill_minutes.p50 / 60)}h · P90 adverse move ${pct(data.cohort_distribution.future_max_away_move_pct.p90)}`;
+      document.getElementById('cohort-note').textContent = `Top ${data.library.top_k_state_matched_episodes} closest states · P50 remaining ${Math.round(data.cohort_distribution.remaining_time_to_fill_minutes.p50 / 60)}h · P90 projected peak away ${pct(cohortFutureMove.p90)}`;
       document.getElementById('cohort-table').innerHTML = [
-        ['Resolved episodes before signal', data.library.eligible_completed_episodes_before_signal.toLocaleString()],
-        ['Same-timeframe trajectory candidates', data.library.same_timeframe_trajectory_candidates_before_signal.toLocaleString()],
+        ['Resolved episodes by snapshot close', data.library.eligible_completed_episodes_before_snapshot.toLocaleString()],
+        ['Same-timeframe trajectory candidates by snapshot close', data.library.same_timeframe_trajectory_candidates_before_snapshot.toLocaleString()],
         ['State-matched cohort', data.library.top_k_state_matched_episodes.toLocaleString()],
         ['Remaining time P25 / P50 / P90', `${Math.round(data.cohort_distribution.remaining_time_to_fill_minutes.p25/60)}h / ${Math.round(data.cohort_distribution.remaining_time_to_fill_minutes.p50/60)}h / ${(data.cohort_distribution.remaining_time_to_fill_minutes.p90/1440).toFixed(1)}d`],
-        ['Future move-away P50 / P90', `${pct(data.cohort_distribution.future_max_away_move_pct.p50)} / ${pct(data.cohort_distribution.future_max_away_move_pct.p90)}`],
+        ['Projected peak-away P50 / P90', `${pct(cohortFutureMove.p50)} / ${pct(cohortFutureMove.p90)}`],
       ].map(([key, value]) => `<tr><th>${key}</th><td>${value}</td></tr>`).join('');
       document.getElementById('method').textContent = data.conditionality + ' Direct scenario candles preserve the pinned timeframe: a 15m historical path is not stretched into invented 5m candles. The current weights and scenario selection remain research settings until chronological path-coverage validation is complete.';
-
       const routeGrid = document.getElementById('route-grid');
-      const risk = data.scenarios.map(s => s.joint_risk_percentile);
       data.scenarios.forEach((scenario, index) => {
         const button = document.createElement('button');
         button.className = 'route'; button.type = 'button'; button.dataset.scenario = scenario.name;
         button.style.setProperty('--route-color', colors[scenario.name]);
-        button.style.setProperty('--rail', `${Math.max(8, Math.min(100, scenario.joint_risk_percentile * 100))}%`);
+        button.style.setProperty('--rail', `${Math.max(8, Math.min(100, scenario.joint_risk_score_percentile * 100))}%`);
         button.setAttribute('aria-pressed', index === 1 ? 'true' : 'false');
-        button.innerHTML = `<div class="route-name"><b>${labels[scenario.name]}</b><span>risk p${Math.round(scenario.joint_risk_percentile * 100)}</span></div>
+        button.innerHTML = `<div class="route-name"><b>${labels[scenario.name]}</b><span>risk score p${Math.round(scenario.joint_risk_score_percentile * 100)}</span></div>
           <p class="route-description">${scenario.description}</p>
-          <div class="route-metrics"><div><label>to wick touch</label><strong>${duration(scenario.remaining_to_fill_bars)}</strong></div><div><label>future move-away</label><strong>${pct(scenario.future_max_away_move_pct)}</strong></div></div><i class="route-rail"></i>`;
+          <div class="route-metrics"><div><label>to wick touch</label><strong>${duration(scenario.remaining_to_fill_bars)}</strong></div><div><label>projected peak away</label><strong>${pct(scenario.projected_future_max_away_move_pct)}</strong></div></div><i class="route-rail"></i>`;
         button.addEventListener('click', () => selectScenario(scenario.name));
         routeGrid.appendChild(button);
       });
@@ -204,7 +203,7 @@ HTML = r'''<!doctype html>
         projected.setData(selected.projected_candles);
         document.getElementById('selected-name').textContent = `${labels[name]} route — conditional historical trajectory`;
         document.getElementById('selected-detail').textContent = `${duration(selected.remaining_to_fill_bars)} remaining · historical ${selected.historical_asset} ${selected.historical_timeframe} · terminal touch ${berlin(selected.projected_candles[selected.projected_candles.length - 1].time + Number(data.pinned_signal.timeframe.replace('m','')) * 60)}`;
-        document.getElementById('chart-note').textContent = `${labels[name]} is one rescaled historical episode selected from the matched cohort. Its future move-away before the wick touch was ${pct(selected.future_max_away_move_pct)} in its original normalised history. It is a scenario reference, not a probability-weighted forecast.`;
+        document.getElementById('chart-note').textContent=labels[name]+' is one rescaled historical episode selected from the matched cohort. Its displayed future candle-envelope peak away from the wick is '+pct(selected.projected_future_max_away_move_pct)+', with '+pct(selected.projected_additional_adverse_move_pct)+' additional adverse movement from the current close. It is a scenario reference, not a probability-weighted forecast.';
         chart.timeScale().fitContent();
       }
       const observer = new ResizeObserver(entries => { for (const entry of entries) chart.applyOptions({ width: entry.contentRect.width, height: entry.contentRect.height }); });

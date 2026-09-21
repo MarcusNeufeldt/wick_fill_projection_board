@@ -110,7 +110,8 @@ def archive_rows(url: str) -> list[list[str]]:
     return rows
 
 
-def current_month_rows(symbol: str, interval: str, interval_ms: int, start_ms: int, end_exclusive_ms: int) -> tuple[list[list[str]], int]:
+def api_rows(symbol: str, interval: str, interval_ms: int, start_ms: int, end_exclusive_ms: int) -> tuple[list[list[str]], int]:
+    """Read one exact candle range from the official USD-M Futures API."""
     rows: list[list[str]] = []
     cursor = start_ms
     requests = 0
@@ -134,6 +135,28 @@ def current_month_rows(symbol: str, interval: str, interval_ms: int, start_ms: i
             raise RuntimeError("Futures API did not advance the candle cursor")
         cursor = next_cursor
     return rows, requests
+
+
+def current_month_rows(symbol: str, interval: str, interval_ms: int, start_ms: int, end_exclusive_ms: int) -> tuple[list[list[str]], int]:
+    """Backward-compatible name for callers that previously requested only the current month."""
+    return api_rows(symbol, interval, interval_ms, start_ms, end_exclusive_ms)
+
+
+def missing_candle_ranges(
+    timestamps: list[int], start_ms: int, end_exclusive_ms: int, interval_ms: int
+) -> list[tuple[int, int]]:
+    """Return contiguous missing [start, end) ranges without masking duplicate timestamps."""
+    cursor = start_ms
+    ranges: list[tuple[int, int]] = []
+    for timestamp in sorted(set(timestamps)):
+        if timestamp < start_ms or timestamp >= end_exclusive_ms:
+            continue
+        if timestamp > cursor:
+            ranges.append((cursor, timestamp))
+        cursor = max(cursor, timestamp + interval_ms)
+    if cursor < end_exclusive_ms:
+        ranges.append((cursor, end_exclusive_ms))
+    return ranges
 
 
 def validate_contract(symbol: str) -> dict[str, object]:
@@ -224,7 +247,13 @@ def main() -> None:
         month = next_month(month)
 
     print(json.dumps({"stage": "download_current_month", "month": current_month.strftime("%Y-%m")}), flush=True)
-    current_rows, api_requests = current_month_rows(symbol, args.interval, interval_ms, int(current_month.timestamp() * 1000), end_exclusive_ms)
+    current_rows, current_month_api_requests = api_rows(
+        symbol,
+        args.interval,
+        interval_ms,
+        int(current_month.timestamp() * 1000),
+        end_exclusive_ms,
+    )
     for row in current_rows:
         if len(row) < len(CSV_HEADER):
             raise RuntimeError("Malformed current-month API row")
@@ -234,6 +263,40 @@ def main() -> None:
             normalized[0] = str(open_time)
             normalized[6] = str(normalize_timestamp(normalized[6]))
             selected_rows.append(normalized)
+
+    # Vision archives occasionally omit historical candles even when the official
+    # Futures API still serves them. Repair only the detected gaps and retain a
+    # precise record in metadata; the exact-row and contiguous-time checks below
+    # remain the final contract.
+    archive_gap_repairs: list[dict[str, object]] = []
+    archive_gap_api_requests = 0
+    for gap_start_ms, gap_end_exclusive_ms in missing_candle_ranges(
+        [int(row[0]) for row in selected_rows], start_ms, end_exclusive_ms, interval_ms
+    ):
+        gap_rows, gap_api_requests = api_rows(
+            symbol, args.interval, interval_ms, gap_start_ms, gap_end_exclusive_ms
+        )
+        archive_gap_api_requests += gap_api_requests
+        repaired_rows = 0
+        for row in gap_rows:
+            if len(row) < len(CSV_HEADER):
+                raise RuntimeError("Malformed Futures API row while repairing an archive gap")
+            open_time = normalize_timestamp(row[0])
+            if gap_start_ms <= open_time < gap_end_exclusive_ms:
+                normalized = list(row[: len(CSV_HEADER)])
+                normalized[0] = str(open_time)
+                normalized[6] = str(normalize_timestamp(normalized[6]))
+                selected_rows.append(normalized)
+                repaired_rows += 1
+        archive_gap_repairs.append(
+            {
+                "start_open_time_utc": utc_iso(gap_start_ms),
+                "end_exclusive_utc": utc_iso(gap_end_exclusive_ms),
+                "expected_rows": (gap_end_exclusive_ms - gap_start_ms) // interval_ms,
+                "api_rows_returned": repaired_rows,
+                "api_requests": gap_api_requests,
+            }
+        )
 
     selected_rows.sort(key=lambda row: int(row[0]))
     expected_rows = (end_exclusive_ms - start_ms) // interval_ms
@@ -266,7 +329,9 @@ def main() -> None:
         "sha256": checksum,
         "monthly_archives": sources,
         "current_month_api": f"{FUTURES_API}/klines",
-        "current_month_api_requests": api_requests,
+        "current_month_api_requests": current_month_api_requests,
+        "archive_gap_api_requests": archive_gap_api_requests,
+        "archive_gap_repairs": archive_gap_repairs,
         "generated_at_utc": utc_iso(int(datetime.now(timezone.utc).timestamp() * 1000)),
     }
     atomic_write_json(metadata_path, metadata)

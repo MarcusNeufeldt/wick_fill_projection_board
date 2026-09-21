@@ -15,16 +15,22 @@ import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
 
+from conditional_wick_assets import (
+    SUPPORTED_ASSETS,
+    default_library_dir,
+    one_minute_library_dir,
+)
 from build_conditional_path_library import (
     FEATURE_COLUMNS,
     FIVE_MINUTES_MS,
     detect_strict_signals,
     read_five_minute_file,
+    read_one_minute_file,
     resample_to_fifteen_minutes,
     utc_iso,
 )
@@ -46,6 +52,8 @@ STATE_WEIGHTS = {
     "elapsed_bars": 0.4,
 }
 CATEGORY_PENALTIES = {"asset": 0.35, "timeframe": 0.25, "direction": 0.10}
+ONE_MINUTE_MATCH_EXACT_BARS = 240
+ONE_MINUTE_MATCH_FIVE_MINUTE_BARS = 1_440
 
 
 def parse_utc(value: str) -> int:
@@ -78,6 +86,10 @@ def robust_scales(events: pd.DataFrame) -> dict[str, float]:
     scales: dict[str, float] = {}
     for name in FEATURE_COLUMNS:
         values = events[name].to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+        if not len(values):
+            scales[name] = 1.0
+            continue
         median = float(np.median(values))
         mad = float(np.median(np.abs(values - median)) * 1.4826)
         fallback = float(np.std(values))
@@ -133,14 +145,115 @@ def read_library_paths(paths_dir: Path, path_files: list[str]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def with_fill_close_time_ms(events: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy with an explicit candle-close timestamp for each completed episode."""
+    value = events.copy()
+    if "fill_close_time_ms" in value.columns:
+        value["fill_close_time_ms"] = pd.to_numeric(value["fill_close_time_ms"], errors="raise").astype("int64")
+        return value
+    required = {"fill_open_time_utc", "interval_minutes"}
+    missing = sorted(required.difference(value.columns))
+    if missing:
+        raise RuntimeError(f"Episode records are missing fields required for fill-close eligibility: {', '.join(missing)}")
+    fill_open_time_ms = pd.to_datetime(value["fill_open_time_utc"], utc=True).map(
+        lambda timestamp: int(timestamp.timestamp() * 1000)
+    )
+    interval_minutes = pd.to_numeric(value["interval_minutes"], errors="raise").astype("int64")
+    value["fill_close_time_ms"] = (fill_open_time_ms + interval_minutes * 60_000).astype("int64")
+    return value
+
+
+def eligible_episodes_at_snapshot(events: pd.DataFrame, snapshot_close_time_ms: int) -> pd.DataFrame:
+    """Keep only episodes whose terminal fill candle was known when the snapshot closed."""
+    value = with_fill_close_time_ms(events)
+    return value.loc[value["fill_close_time_ms"].le(int(snapshot_close_time_ms))].copy()
+
+
+def has_confirmed_departure(later: pd.DataFrame, direction_sign: int, opposite_extreme: float) -> bool:
+    """Use the library's inclusive close-at-or-beyond-opposite-extreme departure rule."""
+    if direction_sign == 1:
+        return bool(later["close"].ge(float(opposite_extreme)).any())
+    return bool(later["close"].le(float(opposite_extreme)).any())
+
+
+def prepare_path_states(events: pd.DataFrame, paths: pd.DataFrame) -> pd.DataFrame:
+    """Build observable historical states using the same signal, phase, and future-window semantics."""
+    required_event_fields = {"episode_id", "signal_to_departure_bars", "signal_to_fill_bars"}
+    missing_event_fields = sorted(required_event_fields.difference(events.columns))
+    if missing_event_fields:
+        raise RuntimeError(
+            "Episode records are missing fields required for post-departure path states: "
+            + ", ".join(missing_event_fields)
+        )
+    event_fields = ["episode_id", "signal_to_departure_bars", "signal_to_fill_bars"]
+    value = paths.merge(events[event_fields], on="episode_id", how="inner", validate="many_to_one")
+    value = value.loc[
+        value["offset_bars"].ge(0) & value["offset_bars"].le(value["signal_to_fill_bars"])
+    ].copy()
+    if value.empty:
+        raise RuntimeError("No trajectory rows remain through the terminal fill candle")
+    value = value.sort_values(["episode_id", "offset_bars"], kind="stable").reset_index(drop=True)
+    value["directional_peak_at_bar"] = np.where(
+        value["direction_sign"].to_numpy(dtype=int) == 1,
+        value["normalized_high_pct"].to_numpy(dtype=float),
+        value["normalized_low_pct"].to_numpy(dtype=float),
+    )
+    value["alignment_peak_move_pct"] = value.groupby("episode_id", sort=False)[
+        "directional_peak_at_bar"
+    ].cummax()
+    value["alignment_current_move_pct"] = value["normalized_close_pct"].astype(float)
+    value["alignment_drawdown_pct"] = np.maximum(
+        0.0, value["alignment_peak_move_pct"] - value["alignment_current_move_pct"]
+    )
+    value["remaining_to_fill_bars"] = value["signal_to_fill_bars"] - value["offset_bars"]
+    # The displayed projection begins after the observable snapshot and includes
+    # the terminal fill candle.  Use the same forward candle-envelope window for
+    # matching, rendering, and replay scoring.
+    value["future_peak_move_pct"] = value.groupby("episode_id", sort=False)["directional_peak_at_bar"].transform(
+        lambda series: series.iloc[::-1].cummax().iloc[::-1].shift(-1)
+    )
+    value["candidate_after_departure"] = (
+        value["offset_bars"].gt(0)
+        & value["offset_bars"].lt(value["signal_to_fill_bars"])
+        & value["offset_bars"].ge(value["signal_to_departure_bars"])
+        & value["alignment_current_move_pct"].gt(0)
+        & value["future_peak_move_pct"].notna()
+    )
+    return value
+
+
+def sampled_matching_states(path_states: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """Keep an adaptive, past-only 1m alignment grid without altering render paths.
+
+    One-minute candles remain intact in every returned scenario.  Only the
+    historical *alignment snapshots* are thinned after the first four hours:
+    every minute through 240 bars, every five minutes through one day, then
+    every fifteen minutes.  This prevents a sparse set of very long 1m paths
+    from making each five-minute live recalculation impractically slow.
+    """
+    if timeframe != "1m":
+        return path_states
+    offsets = path_states["offset_bars"].to_numpy(dtype=np.int64)
+    candidate = path_states["candidate_after_departure"].to_numpy(dtype=bool)
+    keep = candidate & (
+        (offsets <= ONE_MINUTE_MATCH_EXACT_BARS)
+        | ((offsets <= ONE_MINUTE_MATCH_FIVE_MINUTE_BARS) & (offsets % 5 == 0))
+        | (offsets % 15 == 0)
+    )
+    return path_states.loc[keep].copy()
+
+
 def choose_best_alignment(
     events: pd.DataFrame,
-    paths: pd.DataFrame,
+    path_states: pd.DataFrame,
     current_signal: pd.Series,
     current_state: dict[str, float],
     target_asset: str,
     target_timeframe: str,
     target_direction: str,
+    native_state_index: Any | None = None,
+    snapshot_close_time_ms: int | None = None,
+    top_k: int | None = None,
 ) -> pd.DataFrame:
     scales = robust_scales(events)
     target_features = {field: float(current_signal[field]) for field in FEATURE_COLUMNS}
@@ -155,28 +268,26 @@ def choose_best_alignment(
         + (event_scores["direction"] != target_direction).astype(float) * CATEGORY_PENALTIES["direction"]
     )
     event_scores["category_distance"] = category_distance
-    value = paths.merge(
+    if native_state_index is not None and snapshot_close_time_ms is not None and top_k is not None:
+        native = native_state_index.choose(
+            events=events,
+            path_states=path_states,
+            event_scores=event_scores,
+            snapshot_close_time_ms=snapshot_close_time_ms,
+            current_state=current_state,
+            state_weights=STATE_WEIGHTS,
+            top_k=top_k,
+        )
+        if native is not None:
+            return native
+    value = path_states.loc[path_states["candidate_after_departure"]].copy().merge(
         event_scores[["episode_id", "signal_to_fill_bars", "feature_distance", "category_distance"]],
         on="episode_id",
         how="inner",
         validate="many_to_one",
     )
-    value = value.loc[(value["offset_bars"] > 0) & (value["offset_bars"] < value["signal_to_fill_bars"])].copy()
     if value.empty:
-        raise RuntimeError("No historical path states are available for alignment")
-    directional_peak_value = np.where(
-        value["direction_sign"].to_numpy(dtype=int) == 1,
-        value["normalized_high_pct"].to_numpy(dtype=float),
-        value["normalized_low_pct"].to_numpy(dtype=float),
-    )
-    value["directional_peak_at_bar"] = directional_peak_value
-    value = value.sort_values(["episode_id", "offset_bars"], kind="stable")
-    value["alignment_peak_move_pct"] = value.groupby("episode_id", sort=False)["directional_peak_at_bar"].cummax()
-    value["alignment_current_move_pct"] = value["normalized_close_pct"].astype(float)
-    value["alignment_drawdown_pct"] = np.maximum(
-        0.0, value["alignment_peak_move_pct"] - value["alignment_current_move_pct"]
-    )
-    value["remaining_to_fill_bars"] = value["signal_to_fill_bars"] - value["offset_bars"]
+        raise RuntimeError("No post-departure historical path states are available for alignment")
     value["state_distance"] = (
         STATE_WEIGHTS["current_move_pct"]
         * log_distance(value["alignment_current_move_pct"].to_numpy(), current_state["current_move_pct"], 0.30)
@@ -188,11 +299,6 @@ def choose_best_alignment(
         * log_distance(value["offset_bars"].to_numpy(), current_state["elapsed_bars"], 3.0)
     )
     value["match_score"] = value["state_distance"] + 0.5 * value["feature_distance"] + value["category_distance"]
-
-    # Future counter-direction excursion, calculated within the same historical episode.
-    value["future_peak_move_pct"] = value.groupby("episode_id", sort=False)["directional_peak_at_bar"].transform(
-        lambda series: series.iloc[::-1].cummax().iloc[::-1]
-    )
     best_indices = value.groupby("episode_id", sort=False)["match_score"].idxmin()
     return value.loc[best_indices].sort_values("match_score", kind="stable").reset_index(drop=True)
 
@@ -203,15 +309,35 @@ def empirical_percentile(values: np.ndarray, value: float) -> float:
     return float(np.mean(values <= value))
 
 
+def projected_coordinate_matches(matches: pd.DataFrame, current_move_pct: float) -> pd.DataFrame:
+    """Map each comparable future excursion into the pinned wick's price coordinates before ranking it."""
+    value = matches.copy()
+    historical_move = value["alignment_current_move_pct"].to_numpy(dtype=float)
+    if np.any(historical_move <= 0):
+        raise RuntimeError("Historical alignment states must remain on the away-from-wick side before rescaling")
+    scale = float(current_move_pct) / historical_move
+    historical_future = np.maximum(0.0, value["future_peak_move_pct"].to_numpy(dtype=float))
+    projected_future = np.maximum(0.0, historical_future * scale)
+    value["normalization_scale"] = scale
+    value["historical_future_max_away_move_pct"] = historical_future
+    value["projected_future_max_away_move_pct"] = projected_future
+    value["projected_additional_adverse_move_pct"] = np.maximum(0.0, projected_future - float(current_move_pct))
+    return value
+
+
 def select_scenarios(matches: pd.DataFrame, top_k: int) -> list[dict[str, Any]]:
     cohort = matches.head(min(top_k, len(matches))).copy().reset_index(drop=True)
     if len(cohort) < 12:
         raise RuntimeError("Fewer than 12 comparable historical states; scenario selection would be too unstable")
     duration = np.log1p(cohort["remaining_to_fill_bars"].to_numpy(dtype=float))
-    excursion = cohort["future_peak_move_pct"].to_numpy(dtype=float)
+    excursion = cohort["projected_future_max_away_move_pct"].to_numpy(dtype=float)
     duration_rank = pd.Series(duration).rank(pct=True, method="average").to_numpy(dtype=float)
     excursion_rank = pd.Series(excursion).rank(pct=True, method="average").to_numpy(dtype=float)
-    cohort["joint_risk_percentile"] = 0.55 * duration_rank + 0.45 * excursion_rank
+    cohort["joint_risk_score"] = 0.55 * duration_rank + 0.45 * excursion_rank
+    score_values = cohort["joint_risk_score"].to_numpy(dtype=float)
+    cohort["joint_risk_score_percentile"] = np.asarray(
+        [empirical_percentile(score_values, value) for value in score_values], dtype=float
+    )
     cohort["scenario_match_percentile"] = pd.Series(cohort["match_score"]).rank(pct=True, method="average").to_numpy(dtype=float)
 
     median_duration = float(np.median(duration))
@@ -222,21 +348,22 @@ def select_scenarios(matches: pd.DataFrame, top_k: int) -> list[dict[str, Any]]:
     choices: list[tuple[str, str, pd.Series]] = []
     used: set[str] = set()
     definitions = [
-        ("fast", "A real comparable episode near the lower joint duration/excursion risk percentile.", 0.25),
-        ("normal", "The closest joint medoid of remaining duration and future adverse excursion among comparable episodes.", None),
-        ("extreme", "A real comparable episode near the upper joint duration/excursion risk percentile; it is a stress reference, not a worst-case guarantee.", 0.90),
+        ("fast", "A real comparable episode near the lower joint duration/projected-adverse-excursion score percentile.", 0.25),
+        ("normal", "The closest joint medoid of remaining duration and projected future adverse excursion among comparable episodes.", None),
+        ("extreme", "A real comparable episode near the upper joint duration/projected-adverse-excursion score percentile; it is a stress reference, not a worst-case guarantee.", 0.90),
     ]
     for name, description, target_percentile in definitions:
         available = cohort.loc[~cohort["episode_id"].isin(used)].copy()
         if target_percentile is None:
             scenario_score = (
                 np.abs(np.log1p(available["remaining_to_fill_bars"].to_numpy(dtype=float)) - median_duration) / duration_scale
-                + np.abs(available["future_peak_move_pct"].to_numpy(dtype=float) - median_excursion) / excursion_scale
+                + np.abs(available["projected_future_max_away_move_pct"].to_numpy(dtype=float) - median_excursion)
+                / excursion_scale
                 + 0.20 * available["scenario_match_percentile"].to_numpy(dtype=float)
             )
         else:
             scenario_score = (
-                np.abs(available["joint_risk_percentile"].to_numpy(dtype=float) - target_percentile)
+                np.abs(available["joint_risk_score_percentile"].to_numpy(dtype=float) - target_percentile)
                 + 0.18 * available["scenario_match_percentile"].to_numpy(dtype=float)
             )
         selected = available.iloc[int(np.argmin(scenario_score))]
@@ -244,7 +371,8 @@ def select_scenarios(matches: pd.DataFrame, top_k: int) -> list[dict[str, Any]]:
         choices.append((name, description, selected))
     scenarios: list[dict[str, Any]] = []
     for name, description, selected in choices:
-        selected_joint_risk = float(selected["joint_risk_percentile"])
+        selected_joint_risk_score = float(selected["joint_risk_score"])
+        selected_joint_risk_score_percentile = float(selected["joint_risk_score_percentile"])
         scenarios.append(
             {
                 "name": name,
@@ -258,11 +386,14 @@ def select_scenarios(matches: pd.DataFrame, top_k: int) -> list[dict[str, Any]]:
                 "historical_alignment_current_move_pct": float(selected["alignment_current_move_pct"]),
                 "historical_alignment_peak_move_pct": float(selected["alignment_peak_move_pct"]),
                 "historical_alignment_drawdown_pct": float(selected["alignment_drawdown_pct"]),
-                "future_max_away_move_pct": float(selected["future_peak_move_pct"]),
-                "joint_risk_percentile": selected_joint_risk,
+                "historical_future_max_away_move_pct": float(selected["historical_future_max_away_move_pct"]),
+                "projected_future_max_away_move_pct": float(selected["projected_future_max_away_move_pct"]),
+                "projected_additional_adverse_move_pct": float(selected["projected_additional_adverse_move_pct"]),
+                "joint_risk_score": selected_joint_risk_score,
+                "joint_risk_score_percentile": selected_joint_risk_score_percentile,
                 "matched_cohort_size": int(len(cohort)),
                 "matched_cohort_tail_at_or_above_fraction": float(
-                    np.mean(cohort["joint_risk_percentile"].to_numpy(dtype=float) >= selected_joint_risk)
+                    np.mean(cohort["joint_risk_score"].to_numpy(dtype=float) >= selected_joint_risk_score)
                 ),
                 "match_score": float(selected["match_score"]),
             }
@@ -278,9 +409,15 @@ def projected_candles(
     current_move_pct: float,
     projection_start_open_time_ms: int,
     interval_minutes: int,
+    episode_row_spans: Mapping[str, tuple[int, int]] | None = None,
 ) -> tuple[list[dict[str, float | int]], float]:
-    source = paths.loc[paths["episode_id"].eq(scenario["episode_id"])].copy()
-    source = source.sort_values("offset_bars", kind="stable")
+    episode_id = str(scenario["episode_id"])
+    span = episode_row_spans.get(episode_id) if episode_row_spans is not None else None
+    if span is None:
+        source = paths.loc[paths["episode_id"].eq(episode_id)].copy()
+        source = source.sort_values("offset_bars", kind="stable")
+    else:
+        source = paths.iloc[span[0] : span[1]]
     alignment_offset = int(scenario["alignment_offset_bars"])
     aligned = source.loc[source["offset_bars"].eq(alignment_offset)]
     if len(aligned) != 1:
@@ -318,6 +455,142 @@ def projected_candles(
     return output, scale
 
 
+def projected_path_metrics(
+    candles: list[dict[str, float | int]],
+    current_target: float,
+    current_direction_sign: int,
+    current_move_pct: float,
+) -> dict[str, float]:
+    """Measure exactly the rounded candle envelope returned to the chart client."""
+    if not candles:
+        raise RuntimeError("A projected path must contain at least one future candle")
+    if current_direction_sign == 1:
+        directional_values = [(float(candle["high"]) / current_target - 1.0) * 100.0 for candle in candles]
+    else:
+        directional_values = [(1.0 - float(candle["low"]) / current_target) * 100.0 for candle in candles]
+    future_peak = max(0.0, max(directional_values))
+    return {
+        "projected_future_max_away_move_pct": round(float(future_peak), 8),
+        "projected_additional_adverse_move_pct": round(max(0.0, float(future_peak) - current_move_pct), 8),
+    }
+
+
+def project_at(
+    episodes: pd.DataFrame,
+    paths: pd.DataFrame,
+    target_signal: pd.Series,
+    current_state: dict[str, float],
+    snapshot_close_time_ms: int,
+    current_target: float,
+    current_direction_sign: int,
+    projection_start_open_time_ms: int,
+    interval_minutes: int,
+    top_k: int,
+    path_states: pd.DataFrame | None = None,
+    native_state_index: Any | None = None,
+    episode_row_spans: Mapping[str, tuple[int, int]] | None = None,
+) -> dict[str, Any]:
+    """Select and render one shared, snapshot-safe V1 projection result.
+
+    Both serving and chronological replay call this function.  It applies the
+    terminal-fill-close availability rule, excludes pre-departure analogue
+    states, ranks projected-coordinate risk before route selection, and then
+    derives each displayed metric from the exact candles returned to the client.
+    """
+    eligible_events = eligible_episodes_at_snapshot(episodes, snapshot_close_time_ms)
+    if eligible_events.empty:
+        empty_states = pd.DataFrame()
+        return {
+            "eligible_events": eligible_events,
+            "trajectory_events": eligible_events.copy(),
+            "matched_states": empty_states,
+            "cohort": empty_states.copy(),
+            "scenarios": [],
+            "insufficient_matches": True,
+        }
+    target_timeframe = str(target_signal["timeframe"])
+    trajectory_events = eligible_events.loc[eligible_events["timeframe"].eq(target_timeframe)].copy()
+    if trajectory_events.empty:
+        empty_states = pd.DataFrame()
+        return {
+            "eligible_events": eligible_events,
+            "trajectory_events": trajectory_events,
+            "matched_states": empty_states,
+            "cohort": empty_states.copy(),
+            "scenarios": [],
+            "insufficient_matches": True,
+        }
+    trajectory_ids = set(trajectory_events["episode_id"].astype(str))
+    if path_states is None:
+        trajectory_paths = paths.loc[paths["episode_id"].astype(str).isin(trajectory_ids)].copy()
+        states = prepare_path_states(trajectory_events, trajectory_paths)
+    else:
+        all_library_episodes_are_eligible = len(eligible_events) == len(episodes) and len(trajectory_events) == len(episodes)
+        states = (
+            path_states
+            if all_library_episodes_are_eligible
+            else path_states.loc[path_states["episode_id"].astype(str).isin(trajectory_ids)].copy()
+        )
+    # The native index already contains exactly the sampled, post-departure
+    # candidate grid and retains original full-state row IDs for the selected
+    # suffixes. Rebuilding that 1m sample from every state on each live request
+    # copies millions of rows without affecting an exact native selection.
+    native_ready = native_state_index is not None and getattr(native_state_index, "library", None) is not None
+    if not native_ready:
+        states = sampled_matching_states(states, target_timeframe)
+    matched_states = choose_best_alignment(
+        trajectory_events,
+        states,
+        target_signal,
+        current_state,
+        str(target_signal["asset"]),
+        target_timeframe,
+        str(target_signal["direction"]),
+        native_state_index=native_state_index,
+        snapshot_close_time_ms=snapshot_close_time_ms,
+        top_k=top_k,
+    )
+    matched_states = projected_coordinate_matches(matched_states, current_state["current_move_pct"])
+    cohort = matched_states.head(min(top_k, len(matched_states))).copy()
+    if len(cohort) < 12:
+        return {
+            "eligible_events": eligible_events,
+            "trajectory_events": trajectory_events,
+            "matched_states": matched_states,
+            "cohort": cohort,
+            "scenarios": [],
+            "insufficient_matches": True,
+        }
+    scenarios = select_scenarios(matched_states, top_k)
+    for scenario in scenarios:
+        candles, scale = projected_candles(
+            paths,
+            scenario,
+            current_target,
+            current_direction_sign,
+            current_state["current_move_pct"],
+            projection_start_open_time_ms,
+            interval_minutes,
+            episode_row_spans,
+        )
+        scenario["normalization_scale"] = round(float(scale), 8)
+        scenario["projected_candles"] = candles
+        scenario.update(
+            projected_path_metrics(candles, current_target, current_direction_sign, current_state["current_move_pct"])
+        )
+        scenario["projected_terminal_fill_candle_utc"] = utc_iso(
+            candles[-1]["time"] * 1000 + interval_minutes * 60_000
+        )
+    return {
+        "eligible_events": eligible_events,
+        "trajectory_events": trajectory_events,
+        "matched_states": matched_states,
+        "cohort": cohort,
+        "scenarios": scenarios,
+        "insufficient_matches": False,
+    }
+
+
 def actual_candles(frame: pd.DataFrame, start: int, end: int) -> list[dict[str, float | int]]:
     rows: list[dict[str, float | int]] = []
     for candle in frame.iloc[start : end + 1].itertuples(index=False):
@@ -336,10 +609,10 @@ def actual_candles(frame: pd.DataFrame, start: int, end: int) -> list[dict[str, 
 def main() -> None:
     root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--asset", default="ETHUSDT", choices=("ETHUSDT", "BTCUSDT"))
-    parser.add_argument("--timeframe", default="5m", choices=("5m", "15m"))
-    parser.add_argument("--source", type=Path, help="5m source CSV; defaults to the selected five-year asset file")
-    parser.add_argument("--library-dir", type=Path, default=root / "data" / "conditional_path_library_5y")
+    parser.add_argument("--asset", default="ETHUSDT", choices=SUPPORTED_ASSETS)
+    parser.add_argument("--timeframe", default="5m", choices=("1m", "5m", "15m"))
+    parser.add_argument("--source", type=Path, help="Raw source CSV; defaults to the selected five-year asset file")
+    parser.add_argument("--library-dir", type=Path, help="Trajectory library; defaults to the matching timeframe library")
     parser.add_argument("--signal-time", default="2026-09-16T18:35:00Z")
     parser.add_argument("--as-of", help="Last closed candle's open time in UTC; default is the latest source candle")
     parser.add_argument("--top-k", type=int, default=80)
@@ -356,10 +629,10 @@ def main() -> None:
         parser.error("--top-k must be at least 12")
     if args.actual_lookback_bars < 1 or args.signal_context_bars < 0:
         parser.error("--actual-lookback-bars must be positive and --signal-context-bars cannot be negative")
-
-    source_path = args.source or (root / "data" / f"{args.asset}_5m_5y.csv")
-    raw = read_five_minute_file(source_path.resolve())
-    frame = raw if args.timeframe == "5m" else resample_to_fifteen_minutes(raw)
+    source_interval = "1m" if args.timeframe == "1m" else "5m"
+    source_path = args.source or (root / "data" / f"{args.asset}_{source_interval}_5y.csv")
+    raw = (read_one_minute_file if args.timeframe == "1m" else read_five_minute_file)(source_path.resolve())
+    frame = raw if args.timeframe in {"1m", "5m"} else resample_to_fifteen_minutes(raw)
     signal_time_ms = parse_utc(args.signal_time)
     matching_signal = frame.loc[frame["open_time"].eq(signal_time_ms)]
     if matching_signal.empty:
@@ -385,12 +658,10 @@ def main() -> None:
     filled = (later["low"] <= target).any() if direction_sign == 1 else (later["high"] >= target).any()
     if filled:
         raise RuntimeError("Pinned wick has already been fully touched by the supplied as-of candle")
-    departed = (later["close"] > float(signal["high"])).any() if direction_sign == 1 else (
-        later["close"] < float(signal["low"])
-    ).any()
+    departed = has_confirmed_departure(later, direction_sign, float(signal["opposite_extreme"]))
     if not departed:
         raise RuntimeError(
-            "Pinned wick has not yet made the confirmed close beyond the opposite signal extreme required for a conditional path projection"
+            "Pinned wick has not yet made the confirmed close at or beyond the opposite signal extreme required for a conditional path projection"
         )
     current_state = state_for_live_path(
         frame,
@@ -410,70 +681,60 @@ def main() -> None:
     signal_context_start_index = max(0, signal_index - args.signal_context_bars)
     actual_start_index = min(tail_start_index, signal_context_start_index)
 
-    library_dir = args.library_dir.resolve()
+    library_dir = (
+        args.library_dir
+        or (one_minute_library_dir(root, args.asset) if args.timeframe == "1m" else default_library_dir(root))
+    ).resolve()
     episodes_path = library_dir / "episodes.csv"
     summary_path = library_dir / "summary.json"
     if not episodes_path.exists() or not summary_path.exists():
         raise FileNotFoundError("Conditional path library has not been built")
-    episodes = pd.read_csv(episodes_path)
+    episodes = with_fill_close_time_ms(pd.read_csv(episodes_path))
     episodes["signal_open_time_ms"] = pd.to_numeric(episodes["signal_open_time_ms"], errors="raise").astype("int64")
-    # Do not infer the backing unit of Pandas datetime int64 values. Recent
-    # Windows/Pandas builds can retain microsecond resolution here, which would
-    # incorrectly place completed episodes in 1970 and leak future paths into
-    # a historical analogue cohort.
-    episodes["fill_open_time_ms"] = pd.to_datetime(episodes["fill_open_time_utc"], utc=True).map(
-        lambda value: int(value.timestamp() * 1000)
-    )
-    # At the live signal time, only historical episodes already resolved are allowed in the cohort.
-    eligible = episodes.loc[episodes["fill_open_time_ms"] < signal_time_ms].copy()
-    if eligible.empty:
-        raise RuntimeError("No historical completed episodes resolved before the pinned signal")
+    interval_minutes = int(signal["interval_minutes"])
+    snapshot_close_time_ms = int(frame["open_time"].iat[as_of_index]) + interval_minutes * 60_000
+    # Resolve the same snapshot-close candidate population that replay uses.
+    eligible_for_paths = eligible_episodes_at_snapshot(episodes, snapshot_close_time_ms)
+    if eligible_for_paths.empty:
+        raise RuntimeError("No historical completed episodes had closed by the current snapshot")
     # A scenario is rendered as real candles on the pinned chart timeframe.  Mixing
     # a 15m path into a 5m candle chart would invent intrabar candles and distort
     # elapsed time, so cross-timeframe observations remain available to later
     # quantile models but are not direct V1 trajectory candidates.
-    trajectory_eligible = eligible.loc[eligible["timeframe"].eq(args.timeframe)].copy()
-    if trajectory_eligible.empty:
-        raise RuntimeError(f"No historical completed {args.timeframe} episodes resolved before the pinned signal")
+    trajectory_for_paths = eligible_for_paths.loc[eligible_for_paths["timeframe"].eq(args.timeframe)].copy()
+    if trajectory_for_paths.empty:
+        raise RuntimeError(f"No historical completed {args.timeframe} episodes had closed by the current snapshot")
     print(
         json.dumps(
             {
                 "stage": "eligible_episodes",
-                "all_completed_before_signal": int(len(eligible)),
-                "same_timeframe_trajectory_candidates": int(len(trajectory_eligible)),
+                "all_completed_before_snapshot": int(len(eligible_for_paths)),
+                "same_timeframe_trajectory_candidates_before_snapshot": int(len(trajectory_for_paths)),
             }
         ),
         flush=True,
     )
-    paths = read_library_paths(library_dir / "paths", trajectory_eligible["path_file"].tolist())
-    paths = paths.loc[paths["episode_id"].isin(set(trajectory_eligible["episode_id"]))].copy()
-    matched = choose_best_alignment(
-        trajectory_eligible,
+    paths = read_library_paths(library_dir / "paths", trajectory_for_paths["path_file"].tolist())
+    paths = paths.loc[paths["episode_id"].isin(set(trajectory_for_paths["episode_id"]))].copy()
+    projection_start = snapshot_close_time_ms
+    projection = project_at(
+        episodes,
         paths,
         signal,
         current_state,
-        args.asset,
-        args.timeframe,
-        str(signal["direction"]),
+        snapshot_close_time_ms,
+        target,
+        direction_sign,
+        projection_start,
+        interval_minutes,
+        args.top_k,
     )
-    scenarios = select_scenarios(matched, args.top_k)
-    interval_minutes = int(signal["interval_minutes"])
-    projection_start = int(frame["open_time"].iat[as_of_index]) + interval_minutes * 60_000
-    for scenario in scenarios:
-        candles, scale = projected_candles(
-            paths,
-            scenario,
-            target,
-            direction_sign,
-            current_state["current_move_pct"],
-            projection_start,
-            interval_minutes,
-        )
-        scenario["normalization_scale"] = round(scale, 8)
-        scenario["projected_candles"] = candles
-        scenario["projected_terminal_fill_candle_utc"] = utc_iso(
-            (candles[-1]["time"] * 1000 + interval_minutes * 60_000) if candles else projection_start
-        )
+    eligible = projection["eligible_events"]
+    trajectory_eligible = projection["trajectory_events"]
+    matched = projection["matched_states"]
+    scenarios = projection["scenarios"]
+    if projection["insufficient_matches"]:
+        raise RuntimeError("Fewer than 12 comparable historical states; scenario selection would be too unstable")
 
     top_matches = []
     for row in matched.head(min(10, len(matched))).itertuples(index=False):
@@ -485,21 +746,31 @@ def main() -> None:
                 "direction": str(row.direction),
                 "alignment_offset_bars": int(row.offset_bars),
                 "remaining_to_fill_bars": int(row.remaining_to_fill_bars),
-                "future_max_away_move_pct": float(row.future_peak_move_pct),
+                "historical_future_max_away_move_pct": float(row.historical_future_max_away_move_pct),
+                "projected_future_max_away_move_pct": float(row.projected_future_max_away_move_pct),
+                "projected_additional_adverse_move_pct": float(row.projected_additional_adverse_move_pct),
                 "match_score": float(row.match_score),
             }
         )
-    cohort = matched.head(min(args.top_k, len(matched)))
+    cohort = projection["cohort"]
     remaining_minutes = cohort["remaining_to_fill_bars"].to_numpy(dtype=float) * interval_minutes
-    future_move = cohort["future_peak_move_pct"].to_numpy(dtype=float)
+    projected_future_move = cohort["projected_future_max_away_move_pct"].to_numpy(dtype=float)
+    historical_future_move = cohort["historical_future_max_away_move_pct"].to_numpy(dtype=float)
     output = {
-        "schema_version": "1.0.0",
+        "schema_version": "1.1.0",
         "method": "state-conditioned empirical historical trajectory scenarios",
         "conditionality": "Every projected path is a rescaled real historical episode that eventually fully fills its wick; this is not an unconditional fill probability or a trade recommendation.",
+        "projection_semantics": {
+            "candidate_availability": "An analogue is eligible only when its terminal fill candle closed at or before the pinned observation snapshot closed.",
+            "departure": "The pinned signal and analogue alignment must have a close at or beyond the opposite signal extreme; analogue alignment offsets before that departure are excluded.",
+            "future_excursion_window": "Future move-away is the direction-normalized high/low candle envelope after the snapshot through and including the terminal fill candle.",
+            "intrabar_note": "OHLC cannot establish whether a terminal fill-candle extreme happened before or after the wick touch; this is a consistent candle-envelope measurement.",
+        },
         "library": {
             "directory": str(library_dir),
-            "eligible_completed_episodes_before_signal": int(len(eligible)),
-            "same_timeframe_trajectory_candidates_before_signal": int(len(trajectory_eligible)),
+            "availability_cutoff_close_utc": utc_iso(snapshot_close_time_ms),
+            "eligible_completed_episodes_before_snapshot": int(len(eligible)),
+            "same_timeframe_trajectory_candidates_before_snapshot": int(len(trajectory_eligible)),
             "top_k_state_matched_episodes": int(len(cohort)),
             "matching_features": FEATURE_WEIGHTS,
             "matching_state_weights": STATE_WEIGHTS,
@@ -521,6 +792,7 @@ def main() -> None:
         "current_state": {
             **{key: round(float(value), 8) for key, value in current_state.items()},
             "as_of_open_time_utc": utc_iso(int(frame["open_time"].iat[as_of_index])),
+            "as_of_close_time_utc": utc_iso(snapshot_close_time_ms),
             "as_of_close": float(frame["close"].iat[as_of_index]),
         },
         "cohort_distribution": {
@@ -529,9 +801,13 @@ def main() -> None:
                 "p50": float(np.quantile(remaining_minutes, 0.50)),
                 "p90": float(np.quantile(remaining_minutes, 0.90)),
             },
-            "future_max_away_move_pct": {
-                "p50": float(np.quantile(future_move, 0.50)),
-                "p90": float(np.quantile(future_move, 0.90)),
+            "projected_future_max_away_move_pct": {
+                "p50": float(np.quantile(projected_future_move, 0.50)),
+                "p90": float(np.quantile(projected_future_move, 0.90)),
+            },
+            "historical_future_max_away_move_pct": {
+                "p50": float(np.quantile(historical_future_move, 0.50)),
+                "p90": float(np.quantile(historical_future_move, 0.90)),
             },
         },
         "actual_window": {
@@ -548,6 +824,7 @@ def main() -> None:
             "Direct projected candles use only the pinned timeframe; mixing historical 15m bars into a 5m candle path would invent intrabar detail and distort time.",
             "The current feature weights are deliberately transparent starting values; they must be learned or tuned only inside chronological replay folds.",
             "The scenarios preserve real joint historical trajectories but still need path-coverage walk-forward validation before risk use.",
+            "The terminal fill-candle risk uses a complete OHLC envelope; finer data is required to order an intrabar wick touch and extreme exactly.",
         ],
     }
     output_path = args.output.resolve()
@@ -561,7 +838,8 @@ def main() -> None:
                         "name": scenario["name"],
                         "episode_id": scenario["episode_id"],
                         "remaining_bars": scenario["remaining_to_fill_bars"],
-                        "future_max_away_move_pct": scenario["future_max_away_move_pct"],
+                        "projected_future_max_away_move_pct": scenario["projected_future_max_away_move_pct"],
+                        "projected_additional_adverse_move_pct": scenario["projected_additional_adverse_move_pct"],
                     }
                     for scenario in scenarios
                 ],
