@@ -1,15 +1,41 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from build_conditional_path_library import FEATURE_COLUMNS
+from evaluate_prospective_entry_baseline import resolve_dataset_file
 from prospective_entry_model import FEATURE_COLUMNS_V1, features_from_observations
 
 
 class ProspectiveEntryFeatureTests(unittest.TestCase):
+    def test_promoted_dataset_recovers_legacy_staging_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset_dir = Path(temporary) / "prospective_entry_outcomes_v1"
+            installed = dataset_dir / "observations" / "ETHUSDT_5m.parquet"
+            installed.parent.mkdir(parents=True)
+            installed.write_bytes(b"partition")
+            stale = Path(temporary) / ".staging" / "observations" / installed.name
+
+            resolved = resolve_dataset_file(
+                dataset_dir,
+                {"kind": "observations", "path": str(stale)},
+            )
+
+            self.assertEqual(resolved, installed)
+
+    def test_dataset_relative_paths_are_resolved_from_dataset_root(self) -> None:
+        dataset_dir = Path("dataset")
+        resolved = resolve_dataset_file(
+            dataset_dir,
+            {"kind": "observations", "path": "observations/ETHUSDT_5m.parquet"},
+        )
+        self.assertEqual(resolved, dataset_dir / "observations" / "ETHUSDT_5m.parquet")
+
     def test_features_do_not_change_when_future_candles_change(self) -> None:
         rows = 700
         close = 100.0 + np.linspace(0.0, 7.0, rows) + np.sin(np.arange(rows) / 11.0)

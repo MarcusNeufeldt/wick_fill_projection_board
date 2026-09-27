@@ -944,8 +944,18 @@ def main() -> None:
             summaries.append(summary)
             files.extend(
                 [
-                    {"kind": "signals", "asset": asset, "timeframe": timeframe, "path": str(signal_path)},
-                    {"kind": "observations", "asset": asset, "timeframe": timeframe, "path": str(observation_path)},
+                    {
+                        "kind": "signals",
+                        "asset": asset,
+                        "timeframe": timeframe,
+                        "path": signal_path.relative_to(args.output_dir).as_posix(),
+                    },
+                    {
+                        "kind": "observations",
+                        "asset": asset,
+                        "timeframe": timeframe,
+                        "path": observation_path.relative_to(args.output_dir).as_posix(),
+                    },
                 ]
             )
             print(json.dumps(summary, sort_keys=True), flush=True)

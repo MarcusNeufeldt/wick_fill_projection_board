@@ -69,7 +69,14 @@ Run the maintenance CLI whenever enough new fills have accumulated, such as once
 .venv\Scripts\python.exe .\wick_update.py update
 ```
 
-The command refreshes all five Binance 1m/5m sources, rebuilds the pooled 5m and five isolated 1m completed-route libraries, regenerates their native caches, rebuilds the all-outcome observation dataset, and retrains both numerical risk models. It compiles one tracked Rust kernel and uses it for the expensive 1m/5m clean-route tracing, normalized path writing and forward outcome-label scans. Python independently verifies exact signal identity and retains the authoritative episode features, library summaries, dataset schemas and Parquet boundary. The compatibility-only derived 15m routes still use Python. A Rust contract or parity failure stops the manual update. Candidate risk models replace the installed artifacts only when their chronological promotion gate passes; otherwise the existing model remains installed. Every real run writes an ignored JSON manifest under `data/wick_update_runs/` with episode deltas, model decisions, timings, and failures. Each library uses a staging directory, so an interruption during its build leaves that library's last complete version installed; already completed earlier stages remain updated.
+If route libraries and the all-outcome dataset already finished but a later
+model-training stage failed, resume without rebuilding the large route data:
+
+```powershell
+.venv\Scripts\python.exe .\wick_update.py update --models-only
+```
+
+The command refreshes all five Binance 1m/5m sources, rebuilds the pooled 5m and five isolated 1m completed-route libraries, regenerates their native caches, rebuilds the all-outcome observation dataset, and retrains both numerical risk models. It compiles one tracked Rust kernel and uses it for the expensive 1m/5m clean-route tracing, normalized path writing and forward outcome-label scans. Python independently verifies exact signal identity and retains the authoritative episode features, library summaries, dataset schemas and Parquet boundary. The compatibility-only derived 15m routes still use Python. A Rust contract or parity failure stops the manual update. Candidate risk models replace the installed artifacts only when their chronological promotion gate passes; otherwise the existing model remains installed. Every real run writes an ignored JSON manifest under `data/wick_update_runs/` with episode deltas, model decisions, timings, and failures. Each library uses a staging directory, so an interruption during its build leaves that library's last complete version installed; already completed earlier stages remain updated. Outcome metadata stores portable dataset-relative partition paths so a staged dataset remains valid after promotion.
 
 The experimental V3 neural age experts are deliberately outside this maintenance command because V3 is now a legacy comparison. Newly completed episodes become available to V1 and, after rebuilding the frozen/candidate forecast artifact, to C2 route retrieval.
 

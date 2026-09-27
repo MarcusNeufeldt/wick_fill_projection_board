@@ -79,6 +79,33 @@ class WickUpdateTests(unittest.TestCase):
             promote_directory(staged, destination, "test")
             self.assertEqual((destination / "v2_models" / "model.pkl").read_bytes(), b"v2")
 
+    def test_models_only_resumes_without_rebuilding_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = UpdateRunner(
+                root,
+                dry_run=True,
+                skip_refresh=False,
+                models_only=True,
+            )
+            runner.execute()
+
+            command_stages = [
+                item["stage"]
+                for item in runner.manifest["stages"]
+                if "command" in item
+            ]
+            self.assertEqual(
+                command_stages,
+                ["train_and_gate_risk_models", "train_forecast_v1_candidate_5m"],
+            )
+            self.assertTrue(
+                any(
+                    item["stage"] == "reuse_installed_outcomes"
+                    for item in runner.manifest["stages"]
+                )
+            )
+
     def test_validate_outcomes_requires_every_asset_and_timeframe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

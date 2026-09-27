@@ -71,13 +71,27 @@ Treat a complete run as an overnight maintenance job:
 - The default workflow does not retrain V3 and therefore does not use CUDA or the GPU.
 - Keep the computer connected to power and prevent Windows from sleeping until the command finishes.
 
-The dashboard may remain open, although interactive performance can be slower while the update consumes CPU, memory and disk bandwidth.
+On Windows, stop the dashboard before a full update. Its memory-mapped library
+files can prevent an atomic directory promotion. Restart it after the updater
+finishes. A models-only resume does not replace route-library directories.
 
 ## Interruption and recovery
 
 Every route library is built in `data/.wick_update_staging/<run-id>/` and validated before its installed directory is swapped. An interruption during a library build therefore leaves that library's previous installed version intact.
 
 The overall workflow is sequential. If it is interrupted after earlier stages were promoted, those completed stages remain updated while later stages remain old. Raw-source refresh also happens before the library rebuilds. Rerun the same command to converge every layer on the latest source snapshot; source refresh and rebuilds are repeatable.
+
+When every route library and `data/prospective_entry_outcomes_v1` has already
+been promoted and only model training failed, validate and reuse that installed
+dataset instead of repeating the route work:
+
+```powershell
+.venv\Scripts\python.exe .\wick_update.py update --models-only
+```
+
+This mode retrains/gates the 1m and 5m numerical models and writes a new frozen
+5m candidate, but does not refresh candles, rebuild routes/caches, or change the
+active frozen manifest.
 
 A normal failure or keyboard interruption records the result in the run manifest. A force-killed process can leave an ignored staging directory and a manifest whose last state is `running`; neither is used by the dashboard. Verify that no updater process remains before deleting such a staging directory.
 

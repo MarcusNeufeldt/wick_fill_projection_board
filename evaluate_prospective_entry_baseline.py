@@ -59,10 +59,22 @@ def parse_float_list(value: str) -> tuple[float, ...]:
     return result
 
 
+def resolve_dataset_file(dataset_dir: Path, item: dict[str, Any]) -> Path:
+    recorded = Path(item["path"])
+    if not recorded.is_absolute():
+        return dataset_dir / recorded
+    if recorded.exists():
+        return recorded
+    # Dataset metadata created before portable paths were introduced recorded
+    # staging-directory absolutes.  Promotion moves the whole dataset, so
+    # recover those partitions from their stable kind/name inside dataset_dir.
+    return dataset_dir / str(item["kind"]) / recorded.name
+
+
 def read_observations(dataset_dir: Path, timeframe: str) -> tuple[pd.DataFrame, dict[str, Any]]:
     metadata = json.loads((dataset_dir / "metadata.json").read_text(encoding="utf-8"))
     files = [
-        Path(item["path"])
+        resolve_dataset_file(dataset_dir, item)
         for item in metadata["files"]
         if item["kind"] == "observations" and item["timeframe"] == timeframe
     ]

@@ -163,10 +163,18 @@ def promote_file(staged: Path, destination: Path, run_id: str) -> None:
 
 
 class UpdateRunner:
-    def __init__(self, root: Path, *, dry_run: bool, skip_refresh: bool) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        dry_run: bool,
+        skip_refresh: bool,
+        models_only: bool = False,
+    ) -> None:
         self.root = root.resolve()
         self.dry_run = dry_run
         self.skip_refresh = skip_refresh
+        self.models_only = models_only
         self.run_id = run_id_now()
         self.stage_root = self.root / "data" / ".wick_update_staging" / self.run_id
         self.manifest_path = self.root / "data" / "wick_update_runs" / f"{self.run_id}.json"
@@ -500,10 +508,27 @@ class UpdateRunner:
             self.manifest["free_space_at_start_gb"] = round(free_gb, 2)
             self.save()
         try:
-            self.refresh_sources()
-            rust_binary = self.build_rust_kernel()
-            self.rebuild_routes(rust_binary)
-            dataset_dir = self.rebuild_outcomes(rust_binary)
+            if self.models_only:
+                dataset_dir = self.root / "data" / "prospective_entry_outcomes_v1"
+                if self.dry_run:
+                    self.event(
+                        "reuse_installed_outcomes",
+                        "planned",
+                        dataset_dir=str(dataset_dir),
+                    )
+                else:
+                    counts = validate_outcomes(dataset_dir)
+                    self.event(
+                        "reuse_installed_outcomes",
+                        "complete",
+                        dataset_dir=str(dataset_dir),
+                        counts=counts,
+                    )
+            else:
+                self.refresh_sources()
+                rust_binary = self.build_rust_kernel()
+                self.rebuild_routes(rust_binary)
+                dataset_dir = self.rebuild_outcomes(rust_binary)
             self.retrain_risk_models(dataset_dir)
             self.retrain_frozen_forecast_v1(dataset_dir)
         except KeyboardInterrupt:
@@ -544,13 +569,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use the local candle snapshots as-is; useful only for deterministic research",
     )
+    update.add_argument(
+        "--models-only",
+        action="store_true",
+        help="Resume from the validated installed outcome dataset and train model candidates only",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     if args.command == "update":
-        UpdateRunner(Path(__file__).resolve().parent, dry_run=args.dry_run, skip_refresh=args.skip_refresh).execute()
+        UpdateRunner(
+            Path(__file__).resolve().parent,
+            dry_run=args.dry_run,
+            skip_refresh=args.skip_refresh,
+            models_only=args.models_only,
+        ).execute()
 
 
 if __name__ == "__main__":
