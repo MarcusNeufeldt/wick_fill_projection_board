@@ -20,6 +20,15 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
+from candle_archetype import (
+    ARCHETYPE_BLEND_WEIGHT,
+    ARCHETYPE_COMPONENT_SCALES,
+    ARCHETYPE_POOL_SIZE,
+    archetype_distance,
+    archetype_event_scores,
+    archetype_profile,
+    soft_matcher_baseline_contract,
+)
 from conditional_wick_assets import (
     SUPPORTED_ASSETS,
     default_library_dir,
@@ -52,6 +61,15 @@ STATE_WEIGHTS = {
     "elapsed_bars": 0.4,
 }
 CATEGORY_PENALTIES = {"asset": 0.35, "timeframe": 0.25, "direction": 0.10}
+MATCH_SCORE_COMPONENT_COLUMNS = (
+    "state_current_move_contribution",
+    "state_peak_move_contribution",
+    "state_drawdown_contribution",
+    "state_age_contribution",
+    "adaptive_signal_contribution",
+    "archetype_signal_contribution",
+    "category_contribution",
+)
 ONE_MINUTE_MATCH_EXACT_BARS = 240
 ONE_MINUTE_MATCH_FIVE_MINUTE_BARS = 1_440
 
@@ -95,6 +113,69 @@ def robust_scales(events: pd.DataFrame) -> dict[str, float]:
         fallback = float(np.std(values))
         scales[name] = mad if mad > 1e-12 else (fallback if fallback > 1e-12 else 1.0)
     return scales
+
+
+def attach_match_score_components(
+    value: pd.DataFrame, current_state: Mapping[str, float]
+) -> pd.DataFrame:
+    """Expose every additive score term for audit and chronological replay."""
+    output = value.copy()
+    output["state_current_move_contribution"] = STATE_WEIGHTS["current_move_pct"] * log_distance(
+        output["alignment_current_move_pct"].to_numpy(),
+        current_state["current_move_pct"],
+        0.30,
+    )
+    output["state_peak_move_contribution"] = STATE_WEIGHTS["peak_move_pct"] * log_distance(
+        output["alignment_peak_move_pct"].to_numpy(),
+        current_state["peak_move_pct"],
+        0.30,
+    )
+    output["state_drawdown_contribution"] = STATE_WEIGHTS["drawdown_from_peak_pct"] * log_distance(
+        output["alignment_drawdown_pct"].to_numpy(),
+        current_state["drawdown_from_peak_pct"],
+        0.30,
+    )
+    output["state_age_contribution"] = STATE_WEIGHTS["elapsed_bars"] * log_distance(
+        output["offset_bars"].to_numpy(),
+        current_state["elapsed_bars"],
+        3.0,
+    )
+    output["state_distance"] = output[
+        [
+            "state_current_move_contribution",
+            "state_peak_move_contribution",
+            "state_drawdown_contribution",
+            "state_age_contribution",
+        ]
+    ].sum(axis=1)
+    if "adaptive_weighted_feature_distance" not in output:
+        output["adaptive_weighted_feature_distance"] = output["feature_distance"]
+    if "archetype_weighted_feature_distance" not in output:
+        output["archetype_weighted_feature_distance"] = 0.0
+    output["adaptive_signal_contribution"] = (
+        0.5 * output["adaptive_weighted_feature_distance"].astype(float)
+    )
+    output["archetype_signal_contribution"] = (
+        0.5 * output["archetype_weighted_feature_distance"].astype(float)
+    )
+    output["category_contribution"] = output["category_distance"].astype(float)
+    output["match_score"] = output[list(MATCH_SCORE_COMPONENT_COLUMNS)].sum(axis=1)
+    return output
+
+
+def score_component_summary(frame: pd.DataFrame) -> dict[str, dict[str, float]]:
+    """Summarize audited score terms without exposing the full candidate table."""
+    if frame.empty:
+        return {}
+    return {
+        column: {
+            "mean": float(frame[column].mean()),
+            "median": float(frame[column].median()),
+            "p90": float(frame[column].quantile(0.90)),
+        }
+        for column in MATCH_SCORE_COMPONENT_COLUMNS
+        if column in frame
+    }
 
 
 def state_for_live_path(
@@ -254,20 +335,84 @@ def choose_best_alignment(
     native_state_index: Any | None = None,
     snapshot_close_time_ms: int | None = None,
     top_k: int | None = None,
+    matching_mode: str = "adaptive",
+    archetype_pool_size: int = ARCHETYPE_POOL_SIZE,
+    archetype_blend_weight: float = ARCHETYPE_BLEND_WEIGHT,
 ) -> pd.DataFrame:
-    scales = robust_scales(events)
-    target_features = {field: float(current_signal[field]) for field in FEATURE_COLUMNS}
-    event_scores = events[["episode_id", "asset", "timeframe", "direction", "signal_to_fill_bars", *FEATURE_COLUMNS]].copy()
-    feature_score = np.zeros(len(event_scores), dtype=float)
-    for field, weight in FEATURE_WEIGHTS.items():
-        feature_score += weight * np.abs(event_scores[field].to_numpy(dtype=float) - target_features[field]) / scales[field]
-    event_scores["feature_distance"] = feature_score
-    category_distance = (
-        (event_scores["asset"] != target_asset).astype(float) * CATEGORY_PENALTIES["asset"]
-        + (event_scores["timeframe"] != target_timeframe).astype(float) * CATEGORY_PENALTIES["timeframe"]
-        + (event_scores["direction"] != target_direction).astype(float) * CATEGORY_PENALTIES["direction"]
-    )
-    event_scores["category_distance"] = category_distance
+    if matching_mode == "archetype":
+        event_scores = archetype_event_scores(
+            events, current_signal, pool_size=archetype_pool_size
+        )
+        event_scores["adaptive_weighted_feature_distance"] = 0.0
+        event_scores["archetype_weighted_feature_distance"] = event_scores[
+            "feature_distance"
+        ]
+    elif matching_mode in {"adaptive", "blended"}:
+        if not 0.0 <= archetype_blend_weight <= 1.0:
+            raise ValueError("archetype blend weight must be between 0 and 1")
+        scales = robust_scales(events)
+        target_features = {
+            field: float(current_signal[field]) for field in FEATURE_COLUMNS
+        }
+        event_scores = events[
+            [
+                "episode_id",
+                "asset",
+                "timeframe",
+                "direction",
+                "signal_to_fill_bars",
+                *FEATURE_COLUMNS,
+            ]
+        ].copy()
+        feature_score = np.zeros(len(event_scores), dtype=float)
+        for field, weight in FEATURE_WEIGHTS.items():
+            feature_score += (
+                weight
+                * np.abs(
+                    event_scores[field].to_numpy(dtype=float)
+                    - target_features[field]
+                )
+                / scales[field]
+            )
+        if matching_mode == "blended":
+            shape_distance = archetype_distance(events, current_signal)
+            feature_median = max(float(np.median(feature_score)), 1e-12)
+            shape_median = max(float(np.median(shape_distance)), 1e-12)
+            scaled_shape_distance = shape_distance * feature_median / shape_median
+            event_scores["archetype_distance"] = shape_distance
+            event_scores["adaptive_weighted_feature_distance"] = (
+                1.0 - archetype_blend_weight
+            ) * feature_score
+            event_scores["archetype_weighted_feature_distance"] = (
+                archetype_blend_weight * scaled_shape_distance
+            )
+            event_scores["feature_distance"] = event_scores[
+                "adaptive_weighted_feature_distance"
+            ] + event_scores["archetype_weighted_feature_distance"]
+            # Direction is explicitly mirrored. Keep only a softened same-asset
+            # preference; every eligible candle remains available to state matching.
+            category_distance = (
+                (event_scores["asset"] != target_asset).astype(float)
+                * CATEGORY_PENALTIES["asset"]
+                * (1.0 - archetype_blend_weight)
+                + (event_scores["timeframe"] != target_timeframe).astype(float)
+                * CATEGORY_PENALTIES["timeframe"]
+            )
+        else:
+            event_scores["feature_distance"] = feature_score
+            event_scores["adaptive_weighted_feature_distance"] = feature_score
+            event_scores["archetype_weighted_feature_distance"] = 0.0
+            category_distance = (
+                (event_scores["asset"] != target_asset).astype(float)
+                * CATEGORY_PENALTIES["asset"]
+                + (event_scores["timeframe"] != target_timeframe).astype(float)
+                * CATEGORY_PENALTIES["timeframe"]
+                + (event_scores["direction"] != target_direction).astype(float)
+                * CATEGORY_PENALTIES["direction"]
+            )
+        event_scores["category_distance"] = category_distance
+    else:
+        raise ValueError(f"Unsupported matching mode: {matching_mode}")
     if native_state_index is not None and snapshot_close_time_ms is not None and top_k is not None:
         native = native_state_index.choose(
             events=events,
@@ -279,26 +424,44 @@ def choose_best_alignment(
             top_k=top_k,
         )
         if native is not None:
-            return native
+            if native.empty:
+                return native
+            component_fields = [
+                "episode_id",
+                "adaptive_weighted_feature_distance",
+                "archetype_weighted_feature_distance",
+            ]
+            native = native.drop(
+                columns=[
+                    field
+                    for field in component_fields[1:]
+                    if field in native.columns
+                ],
+                errors="ignore",
+            ).merge(
+                event_scores[component_fields],
+                on="episode_id",
+                how="left",
+                validate="many_to_one",
+            )
+            return attach_match_score_components(native, current_state)
+    event_fields = [
+        "episode_id",
+        "signal_to_fill_bars",
+        "feature_distance",
+        "category_distance",
+        "adaptive_weighted_feature_distance",
+        "archetype_weighted_feature_distance",
+    ]
     value = path_states.loc[path_states["candidate_after_departure"]].copy().merge(
-        event_scores[["episode_id", "signal_to_fill_bars", "feature_distance", "category_distance"]],
+        event_scores[event_fields],
         on="episode_id",
         how="inner",
         validate="many_to_one",
     )
     if value.empty:
         raise RuntimeError("No post-departure historical path states are available for alignment")
-    value["state_distance"] = (
-        STATE_WEIGHTS["current_move_pct"]
-        * log_distance(value["alignment_current_move_pct"].to_numpy(), current_state["current_move_pct"], 0.30)
-        + STATE_WEIGHTS["peak_move_pct"]
-        * log_distance(value["alignment_peak_move_pct"].to_numpy(), current_state["peak_move_pct"], 0.30)
-        + STATE_WEIGHTS["drawdown_from_peak_pct"]
-        * log_distance(value["alignment_drawdown_pct"].to_numpy(), current_state["drawdown_from_peak_pct"], 0.30)
-        + STATE_WEIGHTS["elapsed_bars"]
-        * log_distance(value["offset_bars"].to_numpy(), current_state["elapsed_bars"], 3.0)
-    )
-    value["match_score"] = value["state_distance"] + 0.5 * value["feature_distance"] + value["category_distance"]
+    value = attach_match_score_components(value, current_state)
     best_indices = value.groupby("episode_id", sort=False)["match_score"].idxmin()
     return value.loc[best_indices].sort_values("match_score", kind="stable").reset_index(drop=True)
 
@@ -396,6 +559,11 @@ def select_scenarios(matches: pd.DataFrame, top_k: int) -> list[dict[str, Any]]:
                     np.mean(cohort["joint_risk_score"].to_numpy(dtype=float) >= selected_joint_risk_score)
                 ),
                 "match_score": float(selected["match_score"]),
+                "match_score_components": {
+                    column: float(selected[column])
+                    for column in MATCH_SCORE_COMPONENT_COLUMNS
+                    if column in selected.index
+                },
             }
         )
     return scenarios
@@ -489,6 +657,9 @@ def project_at(
     path_states: pd.DataFrame | None = None,
     native_state_index: Any | None = None,
     episode_row_spans: Mapping[str, tuple[int, int]] | None = None,
+    matching_mode: str = "adaptive",
+    archetype_pool_size: int = ARCHETYPE_POOL_SIZE,
+    archetype_blend_weight: float = ARCHETYPE_BLEND_WEIGHT,
 ) -> dict[str, Any]:
     """Select and render one shared, snapshot-safe V1 projection result.
 
@@ -549,6 +720,9 @@ def project_at(
         native_state_index=native_state_index,
         snapshot_close_time_ms=snapshot_close_time_ms,
         top_k=top_k,
+        matching_mode=matching_mode,
+        archetype_pool_size=archetype_pool_size,
+        archetype_blend_weight=archetype_blend_weight,
     )
     matched_states = projected_coordinate_matches(matched_states, current_state["current_move_pct"])
     cohort = matched_states.head(min(top_k, len(matched_states))).copy()
@@ -562,6 +736,18 @@ def project_at(
             "insufficient_matches": True,
         }
     scenarios = select_scenarios(matched_states, top_k)
+    if matching_mode == "archetype":
+        for scenario in scenarios:
+            scenario["description"] = (
+                "Direction-mirrored candle-archetype route. "
+                + str(scenario["description"])
+            )
+    elif matching_mode == "blended":
+        for scenario in scenarios:
+            scenario["description"] = (
+                f"Soft {archetype_blend_weight:.0%} direction-mirrored candle-shape blend. "
+                + str(scenario["description"])
+            )
     for scenario in scenarios:
         candles, scale = projected_candles(
             paths,
@@ -588,6 +774,13 @@ def project_at(
         "cohort": cohort,
         "scenarios": scenarios,
         "insufficient_matches": False,
+        "matching_mode": matching_mode,
+        "matcher_baseline": (
+            soft_matcher_baseline_contract()
+            if matching_mode == "blended"
+            else None
+        ),
+        "score_component_summary": score_component_summary(cohort),
     }
 
 
@@ -616,6 +809,24 @@ def main() -> None:
     parser.add_argument("--signal-time", default="2026-09-16T18:35:00Z")
     parser.add_argument("--as-of", help="Last closed candle's open time in UTC; default is the latest source candle")
     parser.add_argument("--top-k", type=int, default=80)
+    parser.add_argument(
+        "--matching-mode",
+        choices=("adaptive", "blended", "archetype"),
+        default="adaptive",
+        help="Adaptive live-state matching, a soft direction-mirrored shape blend, or hard archetype gating",
+    )
+    parser.add_argument(
+        "--archetype-blend-weight",
+        type=float,
+        default=ARCHETYPE_BLEND_WEIGHT,
+        help="Candle-shape share used by blended matching (0 to 1)",
+    )
+    parser.add_argument(
+        "--archetype-pool-size",
+        type=int,
+        default=ARCHETYPE_POOL_SIZE,
+        help="Closest signal-candle configurations retained before live-state matching",
+    )
     parser.add_argument("--actual-lookback-bars", type=int, default=480)
     parser.add_argument(
         "--signal-context-bars",
@@ -627,6 +838,10 @@ def main() -> None:
     args = parser.parse_args()
     if args.top_k < 12:
         parser.error("--top-k must be at least 12")
+    if args.archetype_pool_size < 12:
+        parser.error("--archetype-pool-size must be at least 12")
+    if not 0.0 <= args.archetype_blend_weight <= 1.0:
+        parser.error("--archetype-blend-weight must be between 0 and 1")
     if args.actual_lookback_bars < 1 or args.signal_context_bars < 0:
         parser.error("--actual-lookback-bars must be positive and --signal-context-bars cannot be negative")
     source_interval = "1m" if args.timeframe == "1m" else "5m"
@@ -728,6 +943,9 @@ def main() -> None:
         projection_start,
         interval_minutes,
         args.top_k,
+        matching_mode=args.matching_mode,
+        archetype_pool_size=args.archetype_pool_size,
+        archetype_blend_weight=args.archetype_blend_weight,
     )
     eligible = projection["eligible_events"]
     trajectory_eligible = projection["trajectory_events"]
@@ -765,6 +983,38 @@ def main() -> None:
             "departure": "The pinned signal and analogue alignment must have a close at or beyond the opposite signal extreme; analogue alignment offsets before that departure are excluded.",
             "future_excursion_window": "Future move-away is the direction-normalized high/low candle envelope after the snapshot through and including the terminal fill candle.",
             "intrabar_note": "OHLC cannot establish whether a terminal fill-candle extreme happened before or after the wick touch; this is a consistent candle-envelope measurement.",
+        },
+        "matching": {
+            "mode": args.matching_mode,
+            "direction_policy": (
+                "upper/lower mirrored"
+                if args.matching_mode in {"blended", "archetype"}
+                else "category-aware"
+            ),
+            "archetype_blend_weight": (
+                args.archetype_blend_weight
+                if args.matching_mode == "blended"
+                else None
+            ),
+            "signal_configuration_pool_size": (
+                min(args.archetype_pool_size, len(trajectory_eligible))
+                if args.matching_mode == "archetype"
+                else (
+                    len(trajectory_eligible)
+                    if args.matching_mode == "blended"
+                    else None
+                )
+            ),
+            "archetype_component_scales": (
+                ARCHETYPE_COMPONENT_SCALES
+                if args.matching_mode in {"blended", "archetype"}
+                else None
+            ),
+            "pinned_archetype": (
+                archetype_profile(signal)
+                if args.matching_mode in {"blended", "archetype"}
+                else None
+            ),
         },
         "library": {
             "directory": str(library_dir),

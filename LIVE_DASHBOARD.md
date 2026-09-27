@@ -13,26 +13,33 @@ To start it again after a reboot or shutdown:
 
 ```powershell
 cd F:\explore\candle_projection_algo
-python .\serve_conditional_wick_dashboard.py --host 127.0.0.1 --port 8793
+.venv\Scripts\python.exe .\serve_conditional_wick_dashboard.py --host 127.0.0.1 --port 8793
 ```
 
 ## What the controls do
 
 1. Select `ETHUSDT`, `BTCUSDT`, `SOLUSDT`, `UNIUSDT`, or `NEARUSDT`, then `1m`, `5m`, or `15m`. Each asset has an isolated `1m` V1 experiment.
 2. Pick a recent unfilled strict wick from the selector, or paste a UTC ISO timestamp.
-3. Click **Project paths**.
+3. Choose `Adaptive live path`, the opt-in `Soft archetype blend`, or `Hard candle archetype`.
+4. Click **Project paths**.
 
 The server rejects a timestamp unless it is a strict wick signal, remains unfilled as of the local data snapshot, and is on the away-from-wick side needed for a conditional path projection.
 
 The browser receives three paths:
 
 - **Fast** — a real comparable episode near the lower joint duration/projected-excursion score percentile.
-- **Normal** — a real comparable episode near the centre of the matched cohort.
+- **Normal** — a real V3 learned continuation inside a validated 1m/5m age regime; otherwise the V1 cohort centre.
 - **Extreme** — a real comparable episode near the upper joint duration/projected-excursion score percentile.
 
 The candles in a displayed route are one rescaled historical OHLC episode. The actual-price window includes 96 candles before the pinned signal and every observed candle through the snapshot, so the signal candle and its move-away leg remain inspectable. The service does not splice candles, fabricate intrabar 5-minute detail from a 15-minute path, or present the result as a fill probability.
 
-The current V2a range card is trained only on 5m snapshots; it intentionally remains unavailable for the 1m experiment and for 15m pins.
+The primary **Risk from current price** card uses frozen architecture `forecast_architecture_v1_5m_2026-09-27` on every 5m pair: E0 owns fill odds and adverse p50, A owns waiting time and adverse p80/p90, and C2 supplies a separate Historical Support disclosure. One-minute views retain the previous all-outcome model until the same rolling evaluation is run on 1m. If a numerical artifact is unavailable, the older clean-fill V2a card remains a 5m-only fallback. Neither numerical layer changes the historical candles drawn by Fast/Normal/Extreme.
+
+`Soft archetype blend` keeps every eligible path. Live distance, peak, retracement, and age remain primary; signal-feature similarity is blended from 70% adaptive robust distance and 30% direction-mirrored candle configuration, with a softened same-asset preference. `Hard candle archetype` retains only the 240 closest configurations and removes asset and direction penalties. Both experiments disable V3 so it cannot replace their Normal route with a broader learned match.
+
+Both modes are deliberately labelled experimental. The hard gate was materially worse than adaptive matching across 215 paired snapshots. A smaller soft-blend pilot improved mean path error by 1.8%, but its uncertainty range still crosses zero. See [CANDLE_ARCHETYPE_EXPERIMENT.md](CANDLE_ARCHETYPE_EXPERIMENT.md) and [SOFT_ARCHETYPE_BLEND_PILOT.md](SOFT_ARCHETYPE_BLEND_PILOT.md).
+
+V3 is a route selector, not the range card. It replaces only the Normal route after loading a validated local age expert. Fast and Extreme remain V1. The current live gates are 1–480 and 481–2,880 bars on 5m, plus 1–2,400 and 2,401–14,400 bars on 1m. Fresh experts use forecast-anchored retrieval; the mature 1m expert uses the learned sequence embedding directly. Pins outside those ranges, all 15m pins, missing artifacts, and any V3 runtime error automatically retain V1. The Observed state panel shows whether the current Normal route came from V3 or V1.
 
 ## Data and live refresh
 
@@ -42,7 +49,7 @@ The header shows the last completed source candle and a live countdown to the ne
 
 ```powershell
 cd F:\explore\candle_projection_algo
-python .\serve_conditional_wick_dashboard.py --host 127.0.0.1 --port 8793 --refresh-seconds 60
+.venv\Scripts\python.exe .\serve_conditional_wick_dashboard.py --host 127.0.0.1 --port 8793 --refresh-seconds 60
 ```
 
 Use `--disable-auto-refresh` only for deterministic replay against a fixed local snapshot. `refresh_futures_klines.py` is also available for a one-shot catch-up. Its ignored `data/*.refresh.json` sidecar records each source-refresh outcome.
@@ -55,6 +62,20 @@ not rebuild the episode library or retrain V2a. Its card therefore shows the
 artifact generation time, its training-label cutoff, and whether the pin age
 matches an exact sampled snapshot age, falls between sampled ages, or lies
 outside the sampled range.
+
+The all-outcome 1m/5m numerical artifacts are also static. By default they live under `%LOCALAPPDATA%\candle_projection_algo\prospective_entry_models\<timeframe>\model.joblib`. Frozen 5m V1 is selected through `5m\active.json`, which pins its immutable versioned filename and SHA-256; the dashboard verifies both before loading it. Override the root with `CANDLE_PROJECTION_MODEL_DIR`. The manual maintenance command rebuilds the inputs and trains a new V1 candidate, but cannot replace or repoint the active frozen artifact. Frozen-v1 snapshots are deduplicated into `%LOCALAPPDATA%\candle_projection_algo\prospective_validation\forecasts.sqlite` with architecture version, artifact hash and actual forecast source. The `forecast_v1_evaluation` view excludes legacy-fallback rows from later prospective scoring.
+
+## Manual learning update
+
+After enough new wicks have resolved, run:
+
+```powershell
+cd F:\explore\candle_projection_algo
+.venv\Scripts\python.exe .\wick_update.py update --dry-run
+.venv\Scripts\python.exe .\wick_update.py update
+```
+
+This is a substantial CPU, RAM and disk-I/O workload and is best run overnight. It updates all five assets at 1m/5m, completed-route libraries, native caches, all-outcome observations and the gated numerical risk models. It does not retrain V3 neural age experts or use the GPU. Libraries are built in staging before each validated swap; if a later stage fails, already completed stages remain updated and rerunning the command safely converges the workflow. See [MODEL_UPDATE_WORKFLOW.md](MODEL_UPDATE_WORKFLOW.md) for the complete operating contract and run-manifest locations.
 
 For every asset at 1m, the selected route remains fully native one-minute data. When a wider `Display candles` value is selected, the service aggregates only the chart payload before sending it to the browser; it does not alter matching, route selection, risk metrics, or the terminal wick touch. This prevents a long extreme route from transferring or rendering tens of thousands of native bars just to aggregate them in the browser. Historical alignment snapshots remain exact through four hours after a signal, sampled every five minutes through one day, and every fifteen minutes thereafter.
 

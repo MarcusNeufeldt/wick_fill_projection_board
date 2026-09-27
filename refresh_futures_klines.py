@@ -18,6 +18,7 @@ import os
 import shutil
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +34,11 @@ from download_futures_klines import (
     utc_iso,
 )
 from conditional_wick_assets import SUPPORTED_ASSETS
+
+try:  # Windows production path.
+    import msvcrt
+except ImportError:  # pragma: no cover - non-Windows development fallback
+    msvcrt = None
 
 
 DEFAULT_SYMBOLS = SUPPORTED_ASSETS
@@ -226,7 +232,7 @@ def completed_end_exclusive_ms(server_time_ms: int, interval_ms: int) -> int:
     return server_time_ms - server_time_ms % interval_ms
 
 
-def refresh_source(
+def _refresh_source_locked(
     symbol: str,
     path: Path,
     *,
@@ -296,6 +302,51 @@ def refresh_source(
         },
     )
     return result
+
+
+@contextmanager
+def _source_refresh_lock(path: Path):
+    """Prevent two dashboard processes from appending the same candle window."""
+    lock_path = path.with_suffix(path.suffix + ".refresh.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    try:
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        if msvcrt is None:  # pragma: no cover
+            yield
+            return
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as error:
+            raise RuntimeError(f"Refresh already in progress for {path.name}") from error
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    finally:
+        handle.close()
+
+
+def refresh_source(
+    symbol: str,
+    path: Path,
+    *,
+    interval: str = "5m",
+    max_catchup_bars: int = 50_000,
+    server_time_ms: int | None = None,
+) -> RefreshResult:
+    with _source_refresh_lock(path):
+        return _refresh_source_locked(
+            symbol,
+            path,
+            interval=interval,
+            max_catchup_bars=max_catchup_bars,
+            server_time_ms=server_time_ms,
+        )
 
 
 def main() -> None:

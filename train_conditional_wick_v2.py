@@ -163,7 +163,11 @@ def evenly_spaced(frame: pd.DataFrame, maximum: int) -> pd.DataFrame:
     return frame.iloc[np.unique(positions)].copy()
 
 
-def load_events(library_dir: Path) -> pd.DataFrame:
+def load_events(
+    library_dir: Path,
+    timeframe: str = "5m",
+    assets: tuple[str, ...] = SUPPORTED_ASSETS,
+) -> pd.DataFrame:
     events_path = library_dir / "episodes.csv"
     if not events_path.exists():
         raise FileNotFoundError(f"Missing episode library: {events_path}")
@@ -186,9 +190,13 @@ def load_events(library_dir: Path) -> pd.DataFrame:
     missing = sorted(required.difference(events.columns))
     if missing:
         raise RuntimeError(f"episodes.csv is missing required V2 columns: {', '.join(missing)}")
-    events = events.loc[events["timeframe"].eq("5m") & events["asset"].isin(SUPPORTED_ASSETS)].copy()
+    events = events.loc[
+        events["timeframe"].eq(timeframe) & events["asset"].isin(assets)
+    ].copy()
     if events.empty:
-        raise RuntimeError(f"No 5m {'/'.join(SUPPORTED_ASSETS)} completed clean-fill episodes are available")
+        raise RuntimeError(
+            f"No {timeframe} {'/'.join(assets)} completed clean-fill episodes are available"
+        )
     events["signal_open_time_ms"] = pd.to_numeric(events["signal_open_time_ms"], errors="raise").astype("int64")
     events["interval_minutes"] = pd.to_numeric(events["interval_minutes"], errors="raise").astype("int64")
     events["signal_to_departure_bars"] = pd.to_numeric(
@@ -204,7 +212,9 @@ def load_events(library_dir: Path) -> pd.DataFrame:
     events[numeric] = events[numeric].apply(pd.to_numeric, errors="coerce")
     events = events.loc[(events["signal_to_fill_bars"] > 1) & (events["fill_close_time_ms"] > events["signal_open_time_ms"])].copy()
     if events.empty:
-        raise RuntimeError("No valid completed 5m clean-fill episodes remain after integrity checks")
+        raise RuntimeError(
+            f"No valid completed {timeframe} clean-fill episodes remain after integrity checks"
+        )
     return events.sort_values(["signal_open_time_ms", "episode_id"], kind="stable").reset_index(drop=True)
 
 
@@ -339,7 +349,12 @@ def chronological_split(
     last_signal = pd.Timestamp(int(events["signal_open_time_ms"].max()), unit="ms", tz="UTC")
     holdout_start = last_signal - pd.DateOffset(months=holdout_months)
     holdout_start_ms = int(holdout_start.timestamp() * 1000)
-    train_resolution_cutoff_ms = holdout_start_ms - embargo_bars * 5 * 60_000
+    interval_minutes = int(events["interval_minutes"].iloc[0])
+    if not events["interval_minutes"].eq(interval_minutes).all():
+        raise ValueError("chronological split requires one native timeframe")
+    train_resolution_cutoff_ms = (
+        holdout_start_ms - embargo_bars * interval_minutes * 60_000
+    )
 
     train = snapshots.loc[
         snapshots["signal_open_time_ms"].lt(holdout_start_ms)
@@ -360,7 +375,7 @@ def chronological_split(
     return train, holdout, {
         "holdout_months": holdout_months,
         "embargo_bars": embargo_bars,
-        "embargo_minutes": embargo_bars * 5,
+        "embargo_minutes": embargo_bars * interval_minutes,
         "holdout_start_utc": utc_iso(holdout_start_ms),
         "train_resolution_cutoff_utc": utc_iso(train_resolution_cutoff_ms),
         "max_train_fill_close_utc": utc_iso(max_train_fill_close_ms),

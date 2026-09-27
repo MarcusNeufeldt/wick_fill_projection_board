@@ -10,8 +10,17 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
+from candle_archetype import (
+    ARCHETYPE_BLEND_WEIGHT,
+    SOFT_MATCHER_BASELINE_VERSION,
+    archetype_distance,
+    archetype_event_scores,
+    soft_matcher_baseline_contract,
+)
 from build_conditional_path_library import FEATURE_COLUMNS, detect_strict_signals, trace_clean_path
 from build_conditional_path_scenarios import (
+    MATCH_SCORE_COMPONENT_COLUMNS,
+    attach_match_score_components,
     eligible_episodes_at_snapshot,
     has_confirmed_departure,
     prepare_path_states,
@@ -22,6 +31,16 @@ from build_conditional_path_scenarios import (
     projected_path_metrics,
     sampled_matching_states,
     select_scenarios,
+)
+from prospective_entry_outcomes import (
+    _observation_record,
+    competing_outcome,
+    materialize_v3_observable_inputs,
+)
+from evaluate_prospective_entry_baseline import (
+    MatcherConfig,
+    robust_feature_scales,
+    score_candidates,
 )
 from build_sol_one_minute_path_library import write_compact_paths
 from conditional_wick_assets import (
@@ -45,6 +64,7 @@ from serve_conditional_wick_dashboard import (
     snapshot_age_support,
     v2_artifact_metadata,
     validate_asset_timeframe,
+    validate_matching_mode,
 )
 from train_conditional_wick_v2 import (
     FUTURE_AWAY_TARGET_SEMANTICS,
@@ -96,6 +116,40 @@ def event_row(episode_id: str, fill_close_time_ms: int, fill_bars: int = 3) -> d
 
 
 class ProjectionSemanticsTests(unittest.TestCase):
+    def test_archetype_distance_treats_wick_direction_as_a_mirror(self) -> None:
+        target = pd.Series(event_row("target", 1_000))
+        candidates = pd.DataFrame(
+            [
+                {**event_row("lower", 1_000), "direction": "lower_wick"},
+                {
+                    **event_row("upper", 1_000),
+                    "direction": "upper_wick",
+                    "direction_sign": -1,
+                },
+            ]
+        )
+        np.testing.assert_allclose(
+            archetype_distance(candidates, target), np.zeros(2), rtol=0, atol=1e-12
+        )
+        scores = archetype_event_scores(candidates, target, pool_size=12)
+        self.assertTrue(np.all(scores["category_distance"] == 0.0))
+        self.assertEqual(set(scores["direction"]), {"lower_wick", "upper_wick"})
+
+    def test_archetype_pool_is_configuration_first(self) -> None:
+        target = pd.Series(event_row("target", 1_000))
+        rows = []
+        for index in range(12):
+            row = event_row(f"far-{index}", 1_000)
+            row["body_pct_of_range"] = 0.05
+            rows.append(row)
+        exact = event_row("exact-opposite", 1_000)
+        exact["direction"] = "upper_wick"
+        exact["direction_sign"] = -1
+        rows.append(exact)
+        scores = archetype_event_scores(pd.DataFrame(rows), target, pool_size=12)
+        self.assertIn("exact-opposite", set(scores["episode_id"]))
+        self.assertEqual(scores.iloc[0]["episode_id"], "exact-opposite")
+
     def test_live_refresh_preserves_the_selected_route_and_chart_viewport(self) -> None:
         self.assertIn("function captureChartViewport()", HTML)
         self.assertIn("function restoreChartViewport(viewport)", HTML)
@@ -203,6 +257,15 @@ class ProjectionSemanticsTests(unittest.TestCase):
         self.assertEqual(display_timeframe_minutes("15m", "5m"), ("15m", 15))
         with self.assertRaisesRegex(ValueError, "smaller"):
             display_timeframe_minutes("1m", "5m")
+
+    def test_dashboard_exposes_validated_archetype_matching_mode(self) -> None:
+        self.assertEqual(validate_matching_mode("adaptive"), "adaptive")
+        self.assertEqual(validate_matching_mode("blended"), "blended")
+        self.assertEqual(validate_matching_mode("archetype"), "archetype")
+        with self.assertRaisesRegex(ValueError, "matching_mode"):
+            validate_matching_mode("unknown")
+        self.assertIn('id="matchingMode"', HTML)
+        self.assertIn("Soft archetype blend", HTML)
 
     def test_incremental_signal_detection_resumes_from_the_cached_generation(self) -> None:
         frame = pd.DataFrame({"open_time": np.arange(200, dtype=np.int64) * 60_000})
@@ -373,6 +436,14 @@ class ProjectionSemanticsTests(unittest.TestCase):
         self.assertNotIn("future", set(result["eligible_events"]["episode_id"]))
         self.assertEqual(len(result["scenarios"]), 3)
         self.assertFalse(result["insufficient_matches"])
+        blended = project_at(
+            events, paths, target, matching_mode="blended", **arguments
+        )
+        self.assertEqual(blended["matching_mode"], "blended")
+        self.assertEqual(len(blended["scenarios"]), 3)
+        self.assertTrue(
+            all("Soft 30%" in item["description"] for item in blended["scenarios"])
+        )
 
         precomputed = prepare_path_states(events, paths)
         with_precomputed = project_at(events, paths, target, path_states=precomputed, **arguments)
@@ -713,6 +784,154 @@ class ProjectionSemanticsTests(unittest.TestCase):
             sum(float(row[asset_indicator_column(asset)]) for asset in SUPPORTED_ASSETS),
             1.0,
         )
+
+    def test_soft_matcher_baseline_is_versioned_and_auditable(self) -> None:
+        contract = soft_matcher_baseline_contract()
+        self.assertEqual(contract["version"], SOFT_MATCHER_BASELINE_VERSION)
+        self.assertEqual(contract["archetype_blend_weight"], ARCHETYPE_BLEND_WEIGHT)
+        self.assertEqual(contract["direction_policy"], "upper/lower mirrored")
+
+        frame = pd.DataFrame(
+            {
+                "alignment_current_move_pct": [2.0],
+                "alignment_peak_move_pct": [4.0],
+                "alignment_drawdown_pct": [2.0],
+                "offset_bars": [24],
+                "feature_distance": [3.0],
+                "adaptive_weighted_feature_distance": [2.1],
+                "archetype_weighted_feature_distance": [0.9],
+                "category_distance": [0.2],
+            }
+        )
+        scored = attach_match_score_components(
+            frame,
+            {
+                "current_move_pct": 3.0,
+                "peak_move_pct": 5.0,
+                "drawdown_from_peak_pct": 2.0,
+                "elapsed_bars": 30.0,
+            },
+        ).iloc[0]
+        self.assertAlmostEqual(
+            float(scored["match_score"]),
+            sum(float(scored[column]) for column in MATCH_SCORE_COMPONENT_COLUMNS),
+        )
+        self.assertAlmostEqual(float(scored["adaptive_signal_contribution"]), 1.05)
+        self.assertAlmostEqual(float(scored["archetype_signal_contribution"]), 0.45)
+
+    def test_prospective_entry_labels_same_bar_order_as_ambiguous(self) -> None:
+        times = np.arange(7, dtype=np.int64) * 60_000
+        frame = pd.DataFrame(
+            {
+                "open_time": times,
+                "close_time": times + 59_999,
+                "open": [101.0, 106.0, 110.0, 110.0, 108.0, 101.0, 100.0],
+                "high": [102.0, 108.0, 111.0, 111.0, 112.0, 103.0, 101.0],
+                "low": [100.0, 104.0, 109.0, 105.0, 99.0, 100.0, 99.0],
+                "close": [101.0, 107.0, 110.0, 109.0, 100.0, 101.0, 100.0],
+                "volume": np.ones(7),
+            }
+        )
+        signal = {
+            "asset": "ETHUSDT",
+            "timeframe": "1m",
+            "direction": "lower_wick",
+            "direction_sign": 1,
+            "open_time": 0,
+            "bar_index": 0,
+            "interval_minutes": 1,
+            "wick_target": 100.0,
+            "signal_volume": 1.0,
+            **{field: 1.0 for field in FEATURE_COLUMNS},
+        }
+        row = _observation_record(
+            frame,
+            signal,
+            departure_index=1,
+            entry_index=2,
+            age_minutes=2,
+            horizons_minutes=(3,),
+            adverse_thresholds_pct=(1.0,),
+        )
+        self.assertEqual(row["entry_price"], 110.0)
+        self.assertEqual(row["target_touch_bars_from_entry"], 2)
+        self.assertEqual(row["first_adverse_1pct_bars_from_entry"], 2)
+        self.assertEqual(row["outcome_3m_vs_1pct"], "ambiguous_intrabar")
+        self.assertAlmostEqual(row["max_adverse_pre_target_lower_3m_pct"], 111 / 110 * 100 - 100)
+        self.assertAlmostEqual(row["max_adverse_pre_target_upper_3m_pct"], 112 / 110 * 100 - 100)
+
+    def test_competing_outcome_preserves_censoring(self) -> None:
+        self.assertEqual(competing_outcome(3, 3, 10, 10), "ambiguous_intrabar")
+        self.assertEqual(competing_outcome(3, 5, 10, 10), "target_first")
+        self.assertEqual(competing_outcome(7, 5, 10, 10), "adverse_first")
+        self.assertEqual(competing_outcome(None, None, 10, 10), "neither")
+        self.assertEqual(competing_outcome(None, None, 10, 4), "right_censored")
+
+    def test_all_outcome_observation_reuses_v3_sequences_without_future(self) -> None:
+        count = 140
+        times = np.arange(count, dtype=np.int64) * 60_000
+        close = np.linspace(100.0, 114.0, count)
+        frame = pd.DataFrame(
+            {
+                "open_time": times,
+                "close_time": times + 59_999,
+                "open": close - 0.1,
+                "high": close + 0.3,
+                "low": close - 0.3,
+                "close": close,
+                "volume": np.linspace(10.0, 20.0, count),
+            }
+        )
+        signal_index = 100
+        entry_index = 120
+        observation = {
+            "timeframe": "1m",
+            "direction_sign": 1,
+            "signal_open_time_ms": int(times[signal_index]),
+            "entry_open_time_ms": int(times[entry_index]),
+            "signal_index": signal_index,
+            "entry_index": entry_index,
+            "entry_age_bars": entry_index - signal_index,
+            "wick_target": 100.0,
+            "signal_volume": float(frame["volume"].iat[signal_index]),
+            **{field: 1.0 for field in FEATURE_COLUMNS},
+        }
+        inputs = materialize_v3_observable_inputs(frame, observation)
+        self.assertEqual(inputs["pre_signal"].shape, (96, 9))
+        self.assertEqual(inputs["recent"].shape, (256, 9))
+        self.assertEqual(inputs["signal_to_entry"].shape, (128, 7))
+        self.assertEqual(inputs["latest_observable_open_time_ms"], int(times[entry_index]))
+
+    def test_prospective_evaluator_matches_live_asset_pooling_topology(self) -> None:
+        candidates = pd.DataFrame(
+            {
+                "asset": ["ETHUSDT", "BTCUSDT"],
+                "timeframe": ["1m", "1m"],
+                "direction": ["upper_wick", "lower_wick"],
+                "entry_distance_from_target_pct": [2.0, 2.0],
+                "peak_distance_from_target_pct": [3.0, 3.0],
+                "drawdown_from_peak_pct": [1.0, 1.0],
+                "entry_age_bars": [60, 60],
+                **{field: [1.0, 1.0] for field in FEATURE_COLUMNS},
+            }
+        )
+        query = candidates.iloc[0].copy()
+        scales = robust_feature_scales(candidates)
+        one_minute = score_candidates(
+            candidates,
+            query,
+            MatcherConfig(0.30, True),
+            scales,
+        )
+        self.assertEqual(one_minute["asset"].tolist(), ["ETHUSDT"])
+        query["timeframe"] = "5m"
+        five_minute = score_candidates(
+            candidates.assign(timeframe="5m"),
+            query,
+            MatcherConfig(0.30, True),
+            scales,
+        )
+        self.assertEqual(set(five_minute["asset"]), {"ETHUSDT", "BTCUSDT"})
 
 
 if __name__ == "__main__":

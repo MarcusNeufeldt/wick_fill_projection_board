@@ -19,11 +19,13 @@ from conditional_wick_assets import (
 
 
 def get_json(url: str, *, timeout: int = 10) -> dict[str, Any]:
-    with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310 - local verification endpoint only
+    with urllib.request.urlopen(url, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
-def expected_projection_as_of(last_closed_open_time_utc: str | None, timeframe: str) -> str | None:
+def expected_projection_as_of(
+    last_closed_open_time_utc: str | None, timeframe: str
+) -> str | None:
     """Map a source generation to the latest complete selected-timeframe candle."""
     if not last_closed_open_time_utc:
         return None
@@ -32,7 +34,11 @@ def expected_projection_as_of(last_closed_open_time_utc: str | None, timeframe: 
     parsed = datetime.fromisoformat(last_closed_open_time_utc.replace("Z", "+00:00"))
     open_seconds = int(parsed.timestamp())
     aligned_seconds = open_seconds - open_seconds % (15 * 60)
-    return datetime.fromtimestamp(aligned_seconds, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    return (
+        datetime.fromtimestamp(aligned_seconds, tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def source_key(asset: str, timeframe: str) -> str:
@@ -50,13 +56,26 @@ def main() -> None:
         action="store_true",
         help="Require a usable live 1m source for every configured asset.",
     )
-    parser.add_argument("--verify-projection", action="store_true", help="Also run the default pin through the dashboard API.")
-    parser.add_argument("--projection-asset", default="ETHUSDT", choices=SUPPORTED_ASSETS)
-    parser.add_argument("--projection-timeframe", default="5m", choices=SUPPORTED_DASHBOARD_TIMEFRAMES)
+    parser.add_argument(
+        "--verify-projection",
+        action="store_true",
+        help="Also run the default pin through the dashboard API.",
+    )
+    parser.add_argument(
+        "--projection-asset", default="ETHUSDT", choices=SUPPORTED_ASSETS
+    )
+    parser.add_argument(
+        "--projection-timeframe", default="5m", choices=SUPPORTED_DASHBOARD_TIMEFRAMES
+    )
     parser.add_argument("--projection-signal-time", default="2026-09-16T18:35:00Z")
+    v3_expectation = parser.add_mutually_exclusive_group()
+    v3_expectation.add_argument("--expect-v3-active", action="store_true")
+    v3_expectation.add_argument("--expect-v3-fallback", action="store_true")
     args = parser.parse_args()
     if args.projection_asset not in assets_for_timeframe(args.projection_timeframe):
-        parser.error(f"{args.projection_timeframe} projection verification does not support {args.projection_asset}")
+        parser.error(
+            f"{args.projection_timeframe} projection verification does not support {args.projection_asset}"
+        )
     base = args.url.rstrip("/")
     last_error: Exception | None = None
     for _ in range(20):
@@ -64,7 +83,7 @@ def main() -> None:
             health = get_json(f"{base}/api/health")
             refresh = get_json(f"{base}/api/refresh-status")
             break
-        except Exception as error:  # Server startup can race this lightweight probe.
+        except Exception as error:  # noqa: BLE001 - startup can race this probe
             last_error = error
             time.sleep(0.25)
     else:
@@ -73,18 +92,24 @@ def main() -> None:
     if health.get("ok") is not True:
         raise AssertionError("Health endpoint did not report ok")
     if bool(refresh.get("enabled")) != args.expect_enabled:
-        raise AssertionError(f"Unexpected refresh enabled state: {refresh.get('enabled')}")
+        raise AssertionError(
+            f"Unexpected refresh enabled state: {refresh.get('enabled')}"
+        )
     if not refresh.get("data_version"):
         raise AssertionError("Refresh status has no data generation")
     sources = refresh.get("sources", {})
     for asset in SUPPORTED_ASSETS:
         source = sources.get(asset, {})
-        if not source.get("available") or not source.get("last_closed_candle_open_time_utc"):
+        if not source.get("available") or not source.get(
+            "last_closed_candle_open_time_utc"
+        ):
             raise AssertionError(f"Refresh status has no usable {asset} source")
     if args.expect_one_minute or args.projection_timeframe == "1m":
         for asset in SUPPORTED_ASSETS:
             one_minute = sources.get(source_key(asset, "1m"), {})
-            if not one_minute.get("available") or not one_minute.get("last_closed_candle_open_time_utc"):
+            if not one_minute.get("available") or not one_minute.get(
+                "last_closed_candle_open_time_utc"
+            ):
                 raise AssertionError(f"Refresh status has no usable {asset} 1m source")
     projection_as_of = None
     projection_elapsed_seconds = None
@@ -96,42 +121,69 @@ def main() -> None:
             timeout=240,
         )
         projection_elapsed_seconds = round(time.monotonic() - projection_started, 3)
-        projection_as_of = projection.get("current_state", {}).get("as_of_open_time_utc")
+        projection_as_of = projection.get("current_state", {}).get(
+            "as_of_open_time_utc"
+        )
         # A five-minute refresh can atomically replace the source while a slower
         # projection is in flight. Re-run once against that new generation
         # instead of falsely comparing the valid older response to newer data.
         refresh_after = get_json(f"{base}/api/refresh-status")
         sources_after = refresh_after.get("sources", {})
-        projection_source_key = source_key(args.projection_asset, args.projection_timeframe)
-        source_last_after = sources_after.get(projection_source_key, {}).get("last_closed_candle_open_time_utc")
-        expected_as_of = expected_projection_as_of(source_last_after, args.projection_timeframe)
-        source_advanced = source_last_after != sources[projection_source_key]["last_closed_candle_open_time_utc"]
+        projection_source_key = source_key(
+            args.projection_asset, args.projection_timeframe
+        )
+        source_last_after = sources_after.get(projection_source_key, {}).get(
+            "last_closed_candle_open_time_utc"
+        )
+        expected_as_of = expected_projection_as_of(
+            source_last_after, args.projection_timeframe
+        )
+        source_advanced = (
+            source_last_after
+            != sources[projection_source_key]["last_closed_candle_open_time_utc"]
+        )
         if projection_as_of != expected_as_of and source_advanced:
             retry_started = time.monotonic()
             projection = get_json(
                 f"{base}/api/scenarios?asset={args.projection_asset}&timeframe={args.projection_timeframe}&signal_time={signal_time}",
                 timeout=240,
             )
-            projection_elapsed_seconds = round(projection_elapsed_seconds + time.monotonic() - retry_started, 3)
-            projection_as_of = projection.get("current_state", {}).get("as_of_open_time_utc")
+            projection_elapsed_seconds = round(
+                projection_elapsed_seconds + time.monotonic() - retry_started, 3
+            )
+            projection_as_of = projection.get("current_state", {}).get(
+                "as_of_open_time_utc"
+            )
             refresh_after = get_json(f"{base}/api/refresh-status")
             sources_after = refresh_after.get("sources", {})
             expected_as_of = expected_projection_as_of(
-                sources_after.get(projection_source_key, {}).get("last_closed_candle_open_time_utc"),
+                sources_after.get(projection_source_key, {}).get(
+                    "last_closed_candle_open_time_utc"
+                ),
                 args.projection_timeframe,
             )
         refresh = refresh_after
         sources = sources_after
         if projection_as_of != expected_as_of:
-            raise AssertionError(f"Projection did not use the current {args.projection_asset} source generation")
-        if [item.get("name") for item in projection.get("scenarios", [])] != ["fast", "normal", "extreme"]:
-            raise AssertionError("Projection did not return the expected three route categories")
+            raise AssertionError(
+                f"Projection did not use the current {args.projection_asset} source generation"
+            )
+        if [item.get("name") for item in projection.get("scenarios", [])] != [
+            "fast",
+            "normal",
+            "extreme",
+        ]:
+            raise AssertionError(
+                "Projection did not return the expected three route categories"
+            )
         if projection.get("schema_version") != "1.1.0":
             raise AssertionError("Projection did not return the corrected V1 schema")
-        if projection.get("library", {}).get("availability_cutoff_close_utc") != projection.get(
-            "current_state", {}
-        ).get("as_of_close_time_utc"):
-            raise AssertionError("Projection availability cutoff does not match its observation snapshot close")
+        if projection.get("library", {}).get(
+            "availability_cutoff_close_utc"
+        ) != projection.get("current_state", {}).get("as_of_close_time_utc"):
+            raise AssertionError(
+                "Projection availability cutoff does not match its observation snapshot close"
+            )
         for scenario in projection["scenarios"]:
             for field in (
                 "historical_future_max_away_move_pct",
@@ -141,7 +193,30 @@ def main() -> None:
                 "joint_risk_score_percentile",
             ):
                 if field not in scenario:
-                    raise AssertionError(f"Projection scenario is missing corrected field: {field}")
+                    raise AssertionError(
+                        f"Projection scenario is missing corrected field: {field}"
+                    )
+        v3_route = projection.get("v3_route", {})
+        normal = next(
+            item for item in projection["scenarios"] if item["name"] == "normal"
+        )
+        if args.expect_v3_active:
+            if v3_route.get("active") is not True:
+                raise AssertionError(
+                    f"V3 was expected to be active: {v3_route.get('reason')}"
+                )
+            expected_selector = f"v3_{v3_route.get('selector')}"
+            if normal.get("selector") != expected_selector:
+                raise AssertionError(
+                    "Active V3 response did not replace the normal route"
+                )
+        if args.expect_v3_fallback:
+            if v3_route.get("active") is not False:
+                raise AssertionError("V3 was expected to retain the V1 normal route")
+            if str(normal.get("selector", "")).startswith("v3_"):
+                raise AssertionError(
+                    "V3 fallback response still returned a V3 normal route"
+                )
         v2 = projection.get("v2_risk", {})
         if v2.get("available"):
             if v2.get("age_support", {}).get("status") not in {
@@ -150,9 +225,25 @@ def main() -> None:
                 "outside_sampled_age",
                 "unknown",
             }:
-                raise AssertionError("V2 diagnostic has no valid snapshot-age support status")
+                raise AssertionError(
+                    "V2 diagnostic has no valid snapshot-age support status"
+                )
             if "artifact" not in v2:
                 raise AssertionError("V2 diagnostic has no static artifact metadata")
+        prospective = projection.get("prospective_risk", {})
+        if args.projection_timeframe in {"1m", "5m"}:
+            if prospective.get("available") is not True:
+                raise AssertionError(
+                    f"Promoted all-outcome risk is unavailable: {prospective.get('reason')}"
+                )
+            expected_horizons = {"1440m", "10080m", "43200m"}
+            if set(prospective.get("fill_probability", {})) != expected_horizons:
+                raise AssertionError("All-outcome risk is missing a display horizon")
+            if prospective.get("support", {}).get("status") not in {
+                "inside_trained_age_range",
+                "outside_trained_age_range",
+            }:
+                raise AssertionError("All-outcome risk has no valid age-support status")
     print(
         json.dumps(
             {
@@ -162,20 +253,37 @@ def main() -> None:
                 "next_refresh_utc": refresh["next_refresh_utc"],
                 "data_version": refresh["data_version"],
                 "source_last_closed": {
-                    asset: sources[asset]["last_closed_candle_open_time_utc"] for asset in SUPPORTED_ASSETS
-                },
-                "one_minute_last_closed": {
-                    asset: sources.get(source_key(asset, "1m"), {}).get("last_closed_candle_open_time_utc")
+                    asset: sources[asset]["last_closed_candle_open_time_utc"]
                     for asset in SUPPORTED_ASSETS
                 },
-                "projection_asset": args.projection_asset if args.verify_projection else None,
-                "projection_timeframe": args.projection_timeframe if args.verify_projection else None,
-                "projection_as_of": projection_as_of,
-                "projection_elapsed_seconds": projection_elapsed_seconds,
-                "projection_matching_backend": projection.get("library", {}).get("matching_backend")
+                "one_minute_last_closed": {
+                    asset: sources.get(source_key(asset, "1m"), {}).get(
+                        "last_closed_candle_open_time_utc"
+                    )
+                    for asset in SUPPORTED_ASSETS
+                },
+                "projection_asset": args.projection_asset
                 if args.verify_projection
                 else None,
-                "projection_performance": projection.get("performance") if args.verify_projection else None,
+                "projection_timeframe": args.projection_timeframe
+                if args.verify_projection
+                else None,
+                "projection_as_of": projection_as_of,
+                "projection_elapsed_seconds": projection_elapsed_seconds,
+                "projection_matching_backend": projection.get("library", {}).get(
+                    "matching_backend"
+                )
+                if args.verify_projection
+                else None,
+                "projection_performance": projection.get("performance")
+                if args.verify_projection
+                else None,
+                "v3_route": projection.get("v3_route")
+                if args.verify_projection
+                else None,
+                "prospective_risk": projection.get("prospective_risk")
+                if args.verify_projection
+                else None,
             }
         )
     )

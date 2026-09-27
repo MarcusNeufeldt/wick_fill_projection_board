@@ -56,15 +56,19 @@ except ImportError as exc:  # pragma: no cover - exercised by the CLI error path
     ) from exc
 
 from build_conditional_path_scenarios import FEATURE_WEIGHTS, STATE_WEIGHTS
-from conditional_wick_assets import default_library_dir
+from conditional_wick_assets import (
+    SUPPORTED_ASSETS,
+    asset_indicator_column,
+    default_library_dir,
+    one_minute_library_dir,
+)
 from train_conditional_wick_v2 import (
     CATEGORICAL_FEATURE_COLUMNS,
     SNAPSHOT_FEATURE_COLUMNS,
-    build_snapshot_dataset,
+    STATIC_FEATURE_COLUMNS,
     chronological_split,
     evenly_spaced,
     load_events,
-    load_paths,
 )
 
 SCHEMA_VERSION = "3.0.0-neural-retrieval-research"
@@ -72,9 +76,102 @@ BAR_MINUTES = 5
 PRE_SIGNAL_LENGTH = 96
 RECENT_LENGTH = 256
 EPISODE_LENGTH = 128
+PRE_SIGNAL_SOURCE_BARS = PRE_SIGNAL_LENGTH
+RECENT_SOURCE_BARS = RECENT_LENGTH
 FUTURE_HORIZON_BARS = np.asarray([1, 3, 6, 12, 24, 48, 96, 192], dtype=np.int64)
 DIRECTION_HORIZON_BARS = np.asarray([6, 12, 48], dtype=np.int64)
 DEFAULT_OFFSETS = [1, 3, 6, 12, 24, 60, 120, 240, 480, 960]
+RETRIEVAL_MODES = ("scalar", "neural", "hybrid", "forecast", "forecast_hybrid")
+AGE_BUCKETS_BARS = (
+    (1, 24, "1-24"),
+    (25, 120, "25-120"),
+    (121, 480, "121-480"),
+    (481, 960, "481-960"),
+    (961, 1_440, "961-1440"),
+    (1_441, 2_880, "1441-2880"),
+    (2_881, 5_760, "2881-5760"),
+    (5_761, 11_520, "5761-11520"),
+    (11_521, 23_040, "11521-23040"),
+    (23_041, 51_840, "23041-51840"),
+    (51_841, np.iinfo(np.int32).max, "51841+"),
+)
+PRE_SIGNAL_CONTEXT_MINUTES = 8 * 60
+RECENT_CONTEXT_MINUTES = 256 * 5
+FUTURE_HORIZON_MINUTES = np.asarray(
+    [5, 15, 30, 60, 120, 240, 480, 960], dtype=np.int64
+)
+DIRECTION_HORIZON_MINUTES = np.asarray([30, 60, 240], dtype=np.int64)
+DEFAULT_OFFSET_MINUTES = np.asarray(
+    [
+        5,
+        15,
+        30,
+        60,
+        120,
+        300,
+        600,
+        1_200,
+        2_400,
+        4_800,
+        7_200,
+        14_400,
+        28_800,
+        57_600,
+        115_200,
+    ],
+    dtype=np.int64,
+)
+AGE_BUCKET_MAX_MINUTES = np.asarray(
+    [120, 600, 2_400, 4_800, 7_200, 14_400, 28_800, 57_600, 115_200, 259_200],
+    dtype=np.int64,
+)
+
+
+def configure_timeframe(timeframe: str) -> None:
+    """Configure bar-based tensors from stable wall-clock research windows."""
+    global BAR_MINUTES
+    global PRE_SIGNAL_SOURCE_BARS
+    global RECENT_SOURCE_BARS
+    global FUTURE_HORIZON_BARS
+    global DIRECTION_HORIZON_BARS
+    global DEFAULT_OFFSETS
+    global AGE_BUCKETS_BARS
+
+    if timeframe not in {"1m", "5m", "15m"}:
+        raise ValueError("timeframe must be 1m, 5m, or 15m")
+    BAR_MINUTES = int(timeframe.removesuffix("m"))
+    PRE_SIGNAL_SOURCE_BARS = max(
+        1, int(np.ceil(PRE_SIGNAL_CONTEXT_MINUTES / BAR_MINUTES))
+    )
+    RECENT_SOURCE_BARS = max(
+        1, int(np.ceil(RECENT_CONTEXT_MINUTES / BAR_MINUTES))
+    )
+    FUTURE_HORIZON_BARS = np.unique(
+        np.maximum(1, np.ceil(FUTURE_HORIZON_MINUTES / BAR_MINUTES).astype(np.int64))
+    )
+    DIRECTION_HORIZON_BARS = np.unique(
+        np.maximum(
+            1, np.ceil(DIRECTION_HORIZON_MINUTES / BAR_MINUTES).astype(np.int64)
+        )
+    )
+    DEFAULT_OFFSETS = sorted(
+        set(
+            np.maximum(
+                1, np.ceil(DEFAULT_OFFSET_MINUTES / BAR_MINUTES).astype(np.int64)
+            ).tolist()
+        )
+    )
+    maxima = np.ceil(AGE_BUCKET_MAX_MINUTES / BAR_MINUTES).astype(np.int64)
+    minimum = 1
+    dynamic_buckets: list[tuple[int, int, str]] = []
+    for maximum in maxima:
+        maximum = max(minimum, int(maximum))
+        dynamic_buckets.append((minimum, maximum, f"{minimum}-{maximum}"))
+        minimum = maximum + 1
+    dynamic_buckets.append(
+        (minimum, np.iinfo(np.int32).max, f"{minimum}+")
+    )
+    AGE_BUCKETS_BARS = tuple(dynamic_buckets)
 RAW_SEQUENCE_CHANNELS = (
     "open_signed_log_distance",
     "high_signed_log_distance",
@@ -161,6 +258,12 @@ class ExperimentConfig:
     validation_fraction: float = 0.15
     embargo_bars: int = 288
     holdout_months: int = 12
+    retrieval_modes: tuple[str, ...] = RETRIEVAL_MODES
+    age_balanced_sampling: bool = False
+    age_balanced_loss: bool = False
+    minimum_offset_bars: int = 1
+    maximum_offset_bars: int | None = None
+    timeframe: str = "5m"
 
 
 @dataclass
@@ -184,6 +287,7 @@ class SampleArrays:
     log_remaining: np.ndarray
     log_excursion: np.ndarray
     curve_log_ratio: np.ndarray
+    curve_distance_pct: np.ndarray
     direction_targets: np.ndarray
     current_move_pct: np.ndarray
     weights: np.ndarray
@@ -197,22 +301,237 @@ def parse_offsets(value: str) -> list[int]:
     return offsets
 
 
-def load_raw_candles(data_dir: Path, asset: str) -> dict[str, np.ndarray]:
-    path = data_dir / f"{asset}_5m_5y.csv"
+def parse_retrieval_modes(value: str) -> tuple[str, ...]:
+    modes = tuple(
+        dict.fromkeys(item.strip() for item in value.split(",") if item.strip())
+    )
+    unknown = sorted(set(modes).difference(RETRIEVAL_MODES))
+    if unknown:
+        raise ValueError(f"unknown retrieval modes: {', '.join(unknown)}")
+    if "scalar" not in modes:
+        raise ValueError("retrieval modes must include scalar for the paired baseline")
+    return modes
+
+
+def load_raw_candles(
+    data_dir: Path, asset: str, timeframe: str = "5m"
+) -> dict[str, np.ndarray]:
+    source_timeframe = "1m" if timeframe == "1m" else "5m"
+    path = data_dir / f"{asset}_{source_timeframe}_5y.csv"
     if not path.exists():
-        raise FileNotFoundError(f"Missing raw 5m candles: {path}")
+        raise FileNotFoundError(f"Missing raw {source_timeframe} candles: {path}")
     columns = ["open_time", "open", "high", "low", "close", "volume"]
-    frame = pd.read_csv(path, usecols=columns)
-    frame[columns] = frame[columns].apply(pd.to_numeric, errors="coerce")
+    frame = pd.read_csv(
+        path,
+        usecols=columns,
+        dtype={
+            "open_time": "int64",
+            "open": "float32",
+            "high": "float32",
+            "low": "float32",
+            "close": "float32",
+            "volume": "float32",
+        },
+    )
     frame = (
         frame.dropna()
         .sort_values("open_time", kind="stable")
         .drop_duplicates("open_time", keep="last")
     )
+    if timeframe == "15m":
+        bucket_ms = 15 * 60_000
+        frame["bucket"] = (frame["open_time"] // bucket_ms) * bucket_ms
+        frame = (
+            frame.groupby("bucket", sort=True, as_index=False)
+            .agg(
+                open=("open", "first"),
+                high=("high", "max"),
+                low=("low", "min"),
+                close=("close", "last"),
+                volume=("volume", "sum"),
+                source_rows=("open_time", "size"),
+            )
+            .rename(columns={"bucket": "open_time"})
+        )
+        frame = frame.loc[frame["source_rows"].eq(3), columns].copy()
     open_time = frame["open_time"].to_numpy(dtype=np.int64)
     if len(open_time) < 2 or np.any(np.diff(open_time) <= 0):
         raise RuntimeError(f"Raw candles are not strictly chronological for {asset}")
-    return {column: frame[column].to_numpy(dtype=np.float64) for column in columns}
+    return {
+        column: frame[column].to_numpy(
+            dtype=np.int64 if column == "open_time" else np.float32
+        )
+        for column in columns
+    }
+
+
+def load_timeframe_library(
+    project_root: Path, library_dir: Path, timeframe: str
+) -> pd.DataFrame:
+    """Load pooled five-asset event metadata without materializing all paths."""
+    if timeframe == "1m":
+        event_frames: list[pd.DataFrame] = []
+        for asset in SUPPORTED_ASSETS:
+            asset_library = one_minute_library_dir(project_root, asset)
+            asset_events = load_events(asset_library, timeframe, (asset,))
+            event_frames.append(asset_events)
+        events = pd.concat(event_frames, ignore_index=True)
+    else:
+        events = load_events(library_dir, timeframe, SUPPORTED_ASSETS)
+    if events["episode_id"].astype(str).duplicated().any():
+        raise RuntimeError("episode IDs must be unique across the pooled library")
+    return (
+        events.sort_values(["signal_open_time_ms", "episode_id"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+
+def episode_path_from_raw(
+    raw: dict[str, np.ndarray], event: pd.Series
+) -> pd.DataFrame:
+    """Reconstruct one normalized signal-to-fill path from the canonical candles."""
+    signal_ms = int(event["signal_open_time_ms"])
+    signal_index = int(np.searchsorted(raw["open_time"], signal_ms))
+    if (
+        signal_index >= len(raw["open_time"])
+        or int(raw["open_time"][signal_index]) != signal_ms
+    ):
+        raise RuntimeError(f"Raw signal candle {signal_ms} is missing")
+    fill_offset = int(event["signal_to_fill_bars"])
+    fill_index = signal_index + fill_offset
+    if fill_index >= len(raw["open_time"]):
+        raise RuntimeError(f"Raw fill candle for {event['episode_id']} is missing")
+    source = slice(signal_index, fill_index + 1)
+    result = pd.DataFrame(
+        {
+            "offset_bars": np.arange(fill_offset + 1, dtype=np.int64),
+            "volume": raw["volume"][source],
+        }
+    )
+    target = float(event["wick_target"])
+    direction_sign = int(event["direction_sign"])
+    for field in ("open", "high", "low", "close"):
+        result[f"normalized_{field}_pct"] = direction_normalized_pct(
+            raw[field][source], target, direction_sign
+        )
+    return result
+
+
+def build_snapshot_dataset_from_raw(
+    events: pd.DataFrame,
+    raw_by_asset: dict[str, dict[str, np.ndarray]],
+    offsets: list[int],
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Build observable snapshot rows without loading multi-gigabyte path files."""
+    rows: list[dict[str, Any]] = []
+    before_departure = 0
+    after_departure = 0
+    path_rows = 0
+    for event in events.itertuples(index=False):
+        raw = raw_by_asset[str(event.asset)]
+        signal_ms = int(event.signal_open_time_ms)
+        signal_index = int(np.searchsorted(raw["open_time"], signal_ms))
+        fill_offset = int(event.signal_to_fill_bars)
+        fill_index = signal_index + fill_offset
+        if (
+            signal_index >= len(raw["open_time"])
+            or int(raw["open_time"][signal_index]) != signal_ms
+            or fill_index >= len(raw["open_time"])
+        ):
+            continue
+        source = slice(signal_index, fill_index + 1)
+        path_rows += fill_offset + 1
+        sign = int(event.direction_sign)
+        target = float(event.wick_target)
+        normalized_open = direction_normalized_pct(raw["open"][source], target, sign)
+        normalized_high = direction_normalized_pct(raw["high"][source], target, sign)
+        normalized_low = direction_normalized_pct(raw["low"][source], target, sign)
+        closes = direction_normalized_pct(raw["close"][source], target, sign)
+        directional = np.where(
+            sign == 1,
+            normalized_high,
+            normalized_low,
+        )
+        peak = np.maximum.accumulate(directional)
+        ranges = np.abs(normalized_high - normalized_low)
+        bodies = np.abs(closes - normalized_open)
+        close_changes = np.diff(closes, prepend=closes[0])
+        volumes = raw["volume"][source]
+        for offset in offsets:
+            if offset >= fill_offset or closes[offset] <= 0:
+                continue
+            before_departure += 1
+            if offset < int(event.signal_to_departure_bars):
+                continue
+            after_departure += 1
+            recent_start = max(0, offset - 2)
+            row = {
+                "episode_id": str(event.episode_id),
+                "asset": str(event.asset),
+                "direction": str(event.direction),
+                "direction_sign": sign,
+                "signal_open_time_ms": int(event.signal_open_time_ms),
+                "fill_close_time_ms": int(event.fill_close_time_ms),
+                "interval_minutes": int(event.interval_minutes),
+                "signal_to_departure_bars": int(event.signal_to_departure_bars),
+                "signal_to_fill_bars": fill_offset,
+                "signal_volume": float(event.signal_volume),
+                "offset_bars": int(offset),
+                "current_move_pct": float(closes[offset]),
+                "peak_move_pct": float(peak[offset]),
+                "drawdown_from_peak_pct": float(max(0.0, peak[offset] - closes[offset])),
+                "current_bar_range_pct": float(ranges[offset]),
+                "current_bar_body_pct": float(bodies[offset]),
+                "recent_abs_close_change_mean_3_pct": float(
+                    np.mean(np.abs(close_changes[recent_start : offset + 1]))
+                ),
+                "recent_bar_range_mean_3_pct": float(
+                    np.mean(ranges[recent_start : offset + 1])
+                ),
+                "log_volume_ratio_to_signal": float(
+                    np.log1p(
+                        max(volumes[offset], 0.0)
+                        / max(float(event.signal_volume), 1e-12)
+                    )
+                ),
+                "elapsed_log_bars": float(np.log1p(offset)),
+                "remaining_bars": fill_offset - offset,
+                "future_max_away_pct": float(np.max(directional[offset + 1 :])),
+                "snapshot_open_time_ms": int(event.signal_open_time_ms)
+                + offset * int(event.interval_minutes) * 60_000,
+                "snapshot_close_time_ms": int(event.signal_open_time_ms)
+                + (offset + 1) * int(event.interval_minutes) * 60_000,
+                "direction_is_lower": float(str(event.direction) == "lower_wick"),
+            }
+            for name in STATIC_FEATURE_COLUMNS:
+                row[name] = float(getattr(event, name))
+            for asset in SUPPORTED_ASSETS:
+                row[asset_indicator_column(asset)] = float(str(event.asset) == asset)
+            rows.append(row)
+    selected = pd.DataFrame(rows)
+    if selected.empty:
+        raise RuntimeError("No observable snapshots were reconstructed from raw candles")
+    finite_columns = [
+        *SNAPSHOT_FEATURE_COLUMNS,
+        *CATEGORICAL_FEATURE_COLUMNS,
+        "remaining_bars",
+        "future_max_away_pct",
+    ]
+    finite = np.isfinite(selected[finite_columns].to_numpy(dtype=float)).all(axis=1)
+    selected = (
+        selected.loc[finite]
+        .sort_values(
+            ["snapshot_close_time_ms", "episode_id", "offset_bars"], kind="stable"
+        )
+        .reset_index(drop=True)
+    )
+    return selected, {
+        "path_rows_through_fill": int(path_rows),
+        "snapshot_rows_before_departure_filter": int(before_departure),
+        "snapshot_rows_after_departure_filter": int(after_departure),
+        "snapshot_rows_before_finite_filter": int(after_departure),
+        "snapshot_rows_after_finite_filter": int(len(selected)),
+    }
 
 
 def raw_window(
@@ -223,32 +542,46 @@ def raw_window(
     direction_sign: int,
     signal_volume: float,
     signal_open_time_ms: int,
+    source_length: int | None = None,
 ) -> np.ndarray:
     times = raw["open_time"]
     end_index = int(np.searchsorted(times, end_open_time_ms))
     if end_index >= len(times) or int(times[end_index]) != int(end_open_time_ms):
         raise RuntimeError(f"Raw candle {end_open_time_ms} is missing")
-    start_index = max(0, end_index - length + 1)
+    requested_source_length = length if source_length is None else source_length
+    start_index = max(0, end_index - requested_source_length + 1)
     source = slice(start_index, end_index + 1)
     count = end_index - start_index + 1
     result = np.zeros((length, len(RAW_SEQUENCE_CHANNELS)), dtype=np.float32)
-    destination = slice(length - count, length)
+    if source_length is None or count == length:
+        destination = slice(length - count, length)
+        source_positions = None
+    else:
+        destination = slice(0, length)
+        source_positions = np.linspace(0.0, float(count - 1), length)
+
+    def sampled(field: str) -> np.ndarray:
+        values = raw[field][source]
+        if source_positions is None:
+            return values
+        return np.interp(source_positions, np.arange(count, dtype=float), values)
 
     normalized = {
-        field: direction_normalized_pct(raw[field][source], target, direction_sign)
+        field: direction_normalized_pct(sampled(field), target, direction_sign)
         for field in ("open", "high", "low", "close")
     }
-    close = raw["close"][source]
+    close = sampled("close")
     previous_close = np.concatenate(([close[0]], close[:-1]))
     log_return = (
         direction_sign
         * np.log(np.maximum(close, 1e-12) / np.maximum(previous_close, 1e-12))
         * 100.0
     )
-    range_pct = np.abs(raw["high"][source] - raw["low"][source]) / target * 100.0
-    volume_ratio = np.maximum(raw["volume"][source], 0.0) / max(
+    range_pct = np.abs(sampled("high") - sampled("low")) / target * 100.0
+    volume_ratio = np.maximum(sampled("volume"), 0.0) / max(
         float(signal_volume), 1e-12
     )
+    sampled_times = sampled("open_time")
 
     result[destination, 0] = signed_log1p(normalized["open"])
     result[destination, 1] = signed_log1p(normalized["high"])
@@ -257,7 +590,7 @@ def raw_window(
     result[destination, 4] = np.clip(log_return, -20.0, 20.0).astype(np.float32)
     result[destination, 5] = np.log1p(range_pct).astype(np.float32)
     result[destination, 6] = np.log1p(volume_ratio).astype(np.float32)
-    result[destination, 7] = (times[source] >= signal_open_time_ms).astype(np.float32)
+    result[destination, 7] = (sampled_times >= signal_open_time_ms).astype(np.float32)
     result[destination, 8] = 1.0
     return result
 
@@ -306,7 +639,7 @@ def future_targets(
     path: pd.DataFrame,
     snapshot_offset: int,
     current_move_pct: float,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     ordered = path.sort_values("offset_bars", kind="stable")
     offsets = ordered["offset_bars"].to_numpy(dtype=np.int64)
     closes = ordered["normalized_close_pct"].to_numpy(dtype=np.float64)
@@ -322,15 +655,31 @@ def future_targets(
         if position >= len(offsets) or int(offsets[position]) != wanted:
             raise RuntimeError(f"Episode path is missing future offset {wanted}")
         future_distances.append(max(0.0, float(closes[position])))
-    ratios = np.clip(
-        np.asarray(future_distances, dtype=np.float32) / denominator, 0.0, 25.0
-    )
+    raw_distances = np.asarray(future_distances, dtype=np.float32)
+    ratios = np.clip(raw_distances / denominator, 0.0, 25.0)
     curve_log_ratio = np.log1p(ratios).astype(np.float32)
     directions = []
     for horizon in DIRECTION_HORIZON_BARS:
         curve_index = int(np.flatnonzero(FUTURE_HORIZON_BARS == horizon)[0])
         directions.append(float(future_distances[curve_index] < current_move_pct))
-    return curve_log_ratio, np.asarray(directions, dtype=np.float32)
+    return (
+        curve_log_ratio,
+        raw_distances,
+        np.asarray(directions, dtype=np.float32),
+    )
+
+
+def curve_denominator(current_move_pct: np.ndarray) -> np.ndarray:
+    """Return the stabilized scale used by the model's curve representation."""
+    return np.maximum(np.asarray(current_move_pct, dtype=np.float64), 0.02)
+
+
+def decode_curve_distances(
+    curve_log_ratio: np.ndarray, current_move_pct: np.ndarray
+) -> np.ndarray:
+    """Decode a model curve without pretending its stabilized scale was absent."""
+    denominator = curve_denominator(current_move_pct)
+    return np.expm1(np.maximum(curve_log_ratio, 0.0)) * denominator[:, None]
 
 
 def inner_chronological_split(
@@ -399,22 +748,97 @@ def inverse_episode_frequency(frame: pd.DataFrame) -> np.ndarray:
     return weights / max(float(weights.mean()), 1e-12)
 
 
+def age_bucket_labels(offset_bars: pd.Series | np.ndarray) -> np.ndarray:
+    """Map snapshot ages to stable product-facing regimes."""
+    offsets = np.asarray(offset_bars, dtype=np.int64)
+    labels = np.full(len(offsets), "unsupported", dtype="U16")
+    for minimum, maximum, label in AGE_BUCKETS_BARS:
+        labels[(offsets >= minimum) & (offsets <= maximum)] = label
+    if np.any(labels == "unsupported"):
+        raise ValueError("snapshot ages must be positive and fit the configured age bins")
+    return labels
+
+
+def age_episode_balanced_weights(frame: pd.DataFrame) -> np.ndarray:
+    """Give every age regime equal loss mass without duplicating long episodes."""
+    work = frame.loc[:, ["episode_id", "offset_bars"]].copy()
+    work["age_bucket"] = age_bucket_labels(work["offset_bars"])
+    rows_per_episode_bucket = (
+        work.groupby(["age_bucket", "episode_id"], observed=True)["episode_id"]
+        .transform("size")
+        .to_numpy(dtype=np.float64)
+    )
+    episodes_per_bucket = (
+        work.groupby("age_bucket", observed=True)["episode_id"]
+        .transform("nunique")
+        .to_numpy(dtype=np.float64)
+    )
+    weights = 1.0 / np.maximum(rows_per_episode_bucket * episodes_per_bucket, 1.0)
+    return (weights / max(float(weights.mean()), 1e-12)).astype(np.float32)
+
+
+def age_stratified_cap(frame: pd.DataFrame, maximum: int) -> pd.DataFrame:
+    """Cap rows while retaining old-age, asset, and direction coverage."""
+    if maximum < 1:
+        raise ValueError("row cap must be positive")
+    if len(frame) <= maximum:
+        return frame.copy()
+    work = frame.copy()
+    work["_age_bucket"] = age_bucket_labels(work["offset_bars"])
+    group_columns = ["_age_bucket", "asset", "direction"]
+    groups = [
+        group.sort_values(["snapshot_close_time_ms", "episode_id"], kind="stable")
+        for _, group in work.groupby(group_columns, sort=True, observed=True)
+    ]
+    quota = max(1, maximum // max(len(groups), 1))
+    selected_parts = [evenly_spaced(group, min(quota, len(group))) for group in groups]
+    selected = pd.concat(selected_parts, ignore_index=False)
+    if len(selected) < maximum:
+        remaining = work.loc[~work.index.isin(selected.index)]
+        if not remaining.empty:
+            selected = pd.concat(
+                [
+                    selected,
+                    evenly_spaced(
+                        remaining, min(maximum - len(selected), len(remaining))
+                    ),
+                ],
+                ignore_index=False,
+            )
+    if len(selected) > maximum:
+        selected = evenly_spaced(selected, maximum)
+    return (
+        selected.drop(columns="_age_bucket")
+        .sort_values(
+            ["snapshot_close_time_ms", "episode_id", "offset_bars"], kind="stable"
+        )
+        .reset_index(drop=True)
+    )
+
+
 def materialize_samples(
     snapshots: pd.DataFrame,
     events: pd.DataFrame,
-    paths: pd.DataFrame,
+    paths: pd.DataFrame | None,
     raw_by_asset: dict[str, dict[str, np.ndarray]],
     label: str,
+    age_balanced_loss: bool = False,
 ) -> SampleArrays:
     event_lookup = events.set_index("episode_id", drop=False)
-    selected_ids = set(snapshots["episode_id"].astype(str))
-    selected_paths = paths.loc[
-        paths["episode_id"].astype(str).isin(selected_ids)
-    ].copy()
-    path_lookup = {
-        str(key): value
-        for key, value in selected_paths.groupby("episode_id", sort=False)
-    }
+    path_lookup = (
+        {}
+        if paths is None
+        else {
+            str(key): value
+            for key, value in paths.loc[
+                paths["episode_id"].astype(str).isin(
+                    set(snapshots["episode_id"].astype(str))
+                )
+            ]
+            .copy()
+            .groupby("episode_id", sort=False)
+        }
+    )
     count = len(snapshots)
     pre_signal = np.empty(
         (count, PRE_SIGNAL_LENGTH, len(RAW_SEQUENCE_CHANNELS)), dtype=np.float32
@@ -426,6 +850,7 @@ def materialize_samples(
         (count, EPISODE_LENGTH, len(EPISODE_SEQUENCE_CHANNELS)), dtype=np.float32
     )
     curve = np.empty((count, len(FUTURE_HORIZON_BARS)), dtype=np.float32)
+    curve_distance = np.empty_like(curve)
     direction = np.empty((count, len(DIRECTION_HORIZON_BARS)), dtype=np.float32)
 
     for output_index, row in enumerate(snapshots.itertuples(index=False)):
@@ -444,6 +869,7 @@ def materialize_samples(
             sign,
             signal_volume,
             signal_ms,
+            source_length=PRE_SIGNAL_SOURCE_BARS,
         )
         recent[output_index] = raw_window(
             raw,
@@ -453,12 +879,21 @@ def materialize_samples(
             sign,
             signal_volume,
             signal_ms,
+            source_length=RECENT_SOURCE_BARS,
         )
-        episode_path = path_lookup[event_id]
+        episode_path = (
+            path_lookup[event_id]
+            if paths is not None
+            else episode_path_from_raw(raw, event)
+        )
         episode[output_index] = episode_window(
             episode_path, int(row.offset_bars), signal_volume
         )
-        curve[output_index], direction[output_index] = future_targets(
+        (
+            curve[output_index],
+            curve_distance[output_index],
+            direction[output_index],
+        ) = future_targets(
             episode_path,
             int(row.offset_bars),
             float(row.current_move_pct),
@@ -479,6 +914,8 @@ def materialize_samples(
         "future_max_away_pct",
         "current_move_pct",
     ]
+    metadata = snapshots.loc[:, metadata_columns].reset_index(drop=True)
+    metadata["age_bucket"] = age_bucket_labels(metadata["offset_bars"])
     return SampleArrays(
         pre_signal=pre_signal,
         recent=recent,
@@ -489,10 +926,15 @@ def materialize_samples(
             np.maximum(snapshots["future_max_away_pct"].to_numpy(dtype=np.float32), 0.0)
         ),
         curve_log_ratio=curve,
+        curve_distance_pct=curve_distance,
         direction_targets=direction,
         current_move_pct=snapshots["current_move_pct"].to_numpy(dtype=np.float32),
-        weights=inverse_episode_frequency(snapshots),
-        metadata=snapshots.loc[:, metadata_columns].reset_index(drop=True),
+        weights=(
+            age_episode_balanced_weights(snapshots)
+            if age_balanced_loss
+            else inverse_episode_frequency(snapshots)
+        ),
+        metadata=metadata,
     )
 
 
@@ -595,6 +1037,8 @@ class NeuralPathModel(nn.Module):
         sequence_width: int = 32,
         embedding_dim: int = 64,
         dropout: float = 0.1,
+        future_horizon_count: int | None = None,
+        direction_horizon_count: int | None = None,
     ) -> None:
         super().__init__()
         self.pre_encoder = SequenceEncoder(
@@ -619,8 +1063,18 @@ class NeuralPathModel(nn.Module):
             nn.GELU(),
         )
         self.risk_head = nn.Linear(embedding_dim, 6)
-        self.curve_head = nn.Linear(embedding_dim, len(FUTURE_HORIZON_BARS))
-        self.direction_head = nn.Linear(embedding_dim, len(DIRECTION_HORIZON_BARS))
+        self.curve_head = nn.Linear(
+            embedding_dim,
+            len(FUTURE_HORIZON_BARS)
+            if future_horizon_count is None
+            else future_horizon_count,
+        )
+        self.direction_head = nn.Linear(
+            embedding_dim,
+            len(DIRECTION_HORIZON_BARS)
+            if direction_horizon_count is None
+            else direction_horizon_count,
+        )
 
     def forward(
         self,
@@ -989,9 +1443,12 @@ def retrieve_predictions(
     holdout_neural_predictions: dict[str, np.ndarray],
     neighbors: int,
     candidate_pool: int,
-    mode: str,
-) -> dict[str, np.ndarray]:
+    modes: tuple[str, ...],
+) -> dict[str, dict[str, np.ndarray]]:
+    if not modes or any(mode not in RETRIEVAL_MODES for mode in modes):
+        raise ValueError("retrieval modes must be a non-empty supported subset")
     episode_ids = fit.metadata["episode_id"].astype(str).to_numpy()
+    fit_offsets = fit.metadata["offset_bars"].to_numpy(dtype=np.int32)
     fit_assets = fit.metadata["asset"].astype(str).to_numpy()
     holdout_assets = holdout.metadata["asset"].astype(str).to_numpy()
     fit_directions = fit.metadata["direction"].astype(str).to_numpy()
@@ -1020,117 +1477,140 @@ def retrieve_predictions(
     )
     fit_forecast_space = (fit_outcome_signature - forecast_center) / forecast_scale
     query_forecast_space = (query_forecast_signature - forecast_center) / forecast_scale
-    result_remaining = np.empty((len(holdout.static), 3), dtype=np.float32)
-    result_excursion = np.empty((len(holdout.static), 3), dtype=np.float32)
-    result_curve = np.empty_like(holdout.curve_log_ratio)
+    results = {
+        f"{mode}_real_path_retrieval": {
+            "remaining": np.empty((len(holdout.static), 3), dtype=np.float32),
+            "excursion": np.empty((len(holdout.static), 3), dtype=np.float32),
+            "curve": np.empty_like(holdout.curve_log_ratio),
+            "selected_episode_id": np.empty(len(holdout.static), dtype=object),
+            "selected_offset_bars": np.empty(len(holdout.static), dtype=np.int32),
+        }
+        for mode in modes
+    }
+    needs_neural = any(mode in {"neural", "hybrid"} for mode in modes)
+    needs_scalar = any(
+        mode in {"scalar", "hybrid", "forecast_hybrid"} for mode in modes
+    )
+    needs_forecast = any(mode in {"forecast", "forecast_hybrid"} for mode in modes)
 
     for start in range(0, len(holdout.static), 128):
         stop = min(len(holdout.static), start + 128)
-        neural_distance = np.maximum(
-            0.0, 1.0 - holdout_embedding[start:stop] @ fit_embedding.T
+        neural_distance = (
+            np.maximum(0.0, 1.0 - holdout_embedding[start:stop] @ fit_embedding.T)
+            if needs_neural
+            else None
         )
-        scalar_distance = np.stack(
-            [
-                v1_scalar_distance(
-                    fit_raw_static,
-                    holdout_raw_static[index],
-                    fit_assets,
-                    holdout_assets[index],
-                    fit_directions,
-                    holdout_directions[index],
-                    feature_scales,
-                )
-                for index in range(start, stop)
-            ],
-            axis=0,
+        scalar_distance = (
+            np.stack(
+                [
+                    v1_scalar_distance(
+                        fit_raw_static,
+                        holdout_raw_static[index],
+                        fit_assets,
+                        holdout_assets[index],
+                        fit_directions,
+                        holdout_directions[index],
+                        feature_scales,
+                    )
+                    for index in range(start, stop)
+                ],
+                axis=0,
+            )
+            if needs_scalar
+            else None
         )
-        forecast_distance = np.mean(
-            np.abs(
-                query_forecast_space[start:stop, None, :]
-                - fit_forecast_space[None, :, :]
-            ),
-            axis=2,
+        forecast_distance = (
+            np.mean(
+                np.abs(
+                    query_forecast_space[start:stop, None, :]
+                    - fit_forecast_space[None, :, :]
+                ),
+                axis=2,
+            )
+            if needs_forecast
+            else None
         )
         for local_index in range(stop - start):
-            if mode == "scalar":
-                pool = np.argpartition(
-                    scalar_distance[local_index],
-                    min(candidate_pool, len(fit_raw_static) - 1),
-                )[:candidate_pool]
-                distance = scalar_distance[local_index, pool]
-            elif mode == "neural":
-                pool = np.argpartition(
-                    neural_distance[local_index],
-                    min(candidate_pool, len(fit_raw_static) - 1),
-                )[:candidate_pool]
-                distance = neural_distance[local_index, pool]
-            elif mode == "hybrid":
-                scalar_pool = np.argpartition(
-                    scalar_distance[local_index],
-                    min(candidate_pool, len(fit_raw_static) - 1),
-                )[:candidate_pool]
-                neural_pool = np.argpartition(
-                    neural_distance[local_index],
-                    min(candidate_pool, len(fit_raw_static) - 1),
-                )[:candidate_pool]
-                pool = np.unique(np.concatenate((scalar_pool, neural_pool)))
-                scalar_part = scalar_distance[local_index, pool]
-                neural_part = neural_distance[local_index, pool]
-                scalar_scale = max(float(np.median(scalar_part)), 1e-6)
-                neural_scale = max(float(np.median(neural_part)), 1e-6)
-                distance = (
-                    0.35 * scalar_part / scalar_scale
-                    + 0.65 * neural_part / neural_scale
-                )
-            elif mode == "forecast":
-                pool = np.argpartition(
-                    forecast_distance[local_index],
-                    min(candidate_pool, len(fit_raw_static) - 1),
-                )[:candidate_pool]
-                distance = forecast_distance[local_index, pool]
-            elif mode == "forecast_hybrid":
-                scalar_pool = np.argpartition(
-                    scalar_distance[local_index],
-                    min(candidate_pool, len(fit_raw_static) - 1),
-                )[:candidate_pool]
-                forecast_pool = np.argpartition(
-                    forecast_distance[local_index],
-                    min(candidate_pool, len(fit_raw_static) - 1),
-                )[:candidate_pool]
-                pool = np.unique(np.concatenate((scalar_pool, forecast_pool)))
-                scalar_part = scalar_distance[local_index, pool]
-                forecast_part = forecast_distance[local_index, pool]
-                scalar_scale = max(float(np.median(scalar_part)), 1e-6)
-                forecast_scale_at_query = max(float(np.median(forecast_part)), 1e-6)
-                distance = (
-                    0.30 * scalar_part / scalar_scale
-                    + 0.70 * forecast_part / forecast_scale_at_query
-                )
-            else:
-                raise ValueError(f"Unknown retrieval mode: {mode}")
+            for mode in modes:
+                if mode == "scalar":
+                    assert scalar_distance is not None
+                    pool = np.argpartition(
+                        scalar_distance[local_index],
+                        min(candidate_pool, len(fit_raw_static) - 1),
+                    )[:candidate_pool]
+                    distance = scalar_distance[local_index, pool]
+                elif mode == "neural":
+                    assert neural_distance is not None
+                    pool = np.argpartition(
+                        neural_distance[local_index],
+                        min(candidate_pool, len(fit_raw_static) - 1),
+                    )[:candidate_pool]
+                    distance = neural_distance[local_index, pool]
+                elif mode == "hybrid":
+                    assert scalar_distance is not None and neural_distance is not None
+                    scalar_pool = np.argpartition(
+                        scalar_distance[local_index],
+                        min(candidate_pool, len(fit_raw_static) - 1),
+                    )[:candidate_pool]
+                    neural_pool = np.argpartition(
+                        neural_distance[local_index],
+                        min(candidate_pool, len(fit_raw_static) - 1),
+                    )[:candidate_pool]
+                    pool = np.unique(np.concatenate((scalar_pool, neural_pool)))
+                    scalar_part = scalar_distance[local_index, pool]
+                    neural_part = neural_distance[local_index, pool]
+                    distance = 0.35 * scalar_part / max(
+                        float(np.median(scalar_part)), 1e-6
+                    ) + 0.65 * neural_part / max(float(np.median(neural_part)), 1e-6)
+                elif mode == "forecast":
+                    assert forecast_distance is not None
+                    pool = np.argpartition(
+                        forecast_distance[local_index],
+                        min(candidate_pool, len(fit_raw_static) - 1),
+                    )[:candidate_pool]
+                    distance = forecast_distance[local_index, pool]
+                else:
+                    assert scalar_distance is not None and forecast_distance is not None
+                    scalar_pool = np.argpartition(
+                        scalar_distance[local_index],
+                        min(candidate_pool, len(fit_raw_static) - 1),
+                    )[:candidate_pool]
+                    forecast_pool = np.argpartition(
+                        forecast_distance[local_index],
+                        min(candidate_pool, len(fit_raw_static) - 1),
+                    )[:candidate_pool]
+                    pool = np.unique(np.concatenate((scalar_pool, forecast_pool)))
+                    scalar_part = scalar_distance[local_index, pool]
+                    forecast_part = forecast_distance[local_index, pool]
+                    distance = 0.30 * scalar_part / max(
+                        float(np.median(scalar_part)), 1e-6
+                    ) + 0.70 * forecast_part / max(
+                        float(np.median(forecast_part)), 1e-6
+                    )
 
-            chosen, chosen_distance = dedupe_alignments(
-                pool, distance, episode_ids, neighbors
-            )
-            if len(chosen) < 3:
-                raise RuntimeError(
-                    "Retrieval produced fewer than three distinct historical episodes"
+                chosen, chosen_distance = dedupe_alignments(
+                    pool, distance, episode_ids, neighbors
                 )
-            temperature = max(float(np.median(chosen_distance)), 1e-4)
-            weights = np.exp(-chosen_distance / temperature) + 1e-6
-            result_remaining[start + local_index] = weighted_quantiles(
-                fit.log_remaining[chosen], weights, (0.1, 0.5, 0.9)
-            )
-            result_excursion[start + local_index] = weighted_quantiles(
-                fit.log_excursion[chosen], weights, (0.1, 0.5, 0.9)
-            )
-            medoid = select_real_medoid(fit.curve_log_ratio[chosen], weights)
-            result_curve[start + local_index] = fit.curve_log_ratio[chosen[medoid]]
-    return {
-        "remaining": result_remaining,
-        "excursion": result_excursion,
-        "curve": result_curve,
-    }
+                if len(chosen) < 3:
+                    raise RuntimeError(
+                        "Retrieval produced fewer than three distinct historical episodes"
+                    )
+                temperature = max(float(np.median(chosen_distance)), 1e-4)
+                weights = np.exp(-chosen_distance / temperature) + 1e-6
+                destination = results[f"{mode}_real_path_retrieval"]
+                row_index = start + local_index
+                destination["remaining"][row_index] = weighted_quantiles(
+                    fit.log_remaining[chosen], weights, (0.1, 0.5, 0.9)
+                )
+                destination["excursion"][row_index] = weighted_quantiles(
+                    fit.log_excursion[chosen], weights, (0.1, 0.5, 0.9)
+                )
+                medoid = select_real_medoid(fit.curve_log_ratio[chosen], weights)
+                selected = int(chosen[medoid])
+                destination["curve"][row_index] = fit.curve_log_ratio[selected]
+                destination["selected_episode_id"][row_index] = episode_ids[selected]
+                destination["selected_offset_bars"][row_index] = fit_offsets[selected]
+    return results
 
 
 def risk_metrics(actual_log: np.ndarray, predicted_log: np.ndarray) -> dict[str, float]:
@@ -1156,12 +1636,9 @@ def path_metrics(
         np.ones(len(samples.current_move_pct), dtype=bool) if mask is None else mask
     )
     current_move = samples.current_move_pct[selected]
-    actual_distance = (
-        np.expm1(samples.curve_log_ratio[selected]) * current_move[:, None]
-    )
-    predicted_distance = (
-        np.expm1(np.maximum(predicted_curve_log_ratio[selected], 0.0))
-        * current_move[:, None]
+    actual_distance = samples.curve_distance_pct[selected]
+    predicted_distance = decode_curve_distances(
+        predicted_curve_log_ratio[selected], current_move
     )
     per_horizon = np.mean(np.abs(actual_distance - predicted_distance), axis=0)
     direction_accuracy: dict[str, float] = {}
@@ -1272,7 +1749,8 @@ def comparison_vs_scalar(
     scalar = retrievals["scalar_real_path_retrieval"]
     actual_remaining = np.expm1(holdout.log_remaining)
     actual_excursion = np.expm1(holdout.log_excursion)
-    actual_curve = np.expm1(holdout.curve_log_ratio) * holdout.current_move_pct[:, None]
+    actual_curve = holdout.curve_distance_pct
+    predicted_curve_scale = curve_denominator(holdout.current_move_pct)[:, None]
     episode_ids = holdout.metadata["episode_id"].astype(str).to_numpy()
     scalar_errors = {
         "remaining_bars": np.abs(
@@ -1282,10 +1760,7 @@ def comparison_vs_scalar(
             actual_excursion - np.expm1(scalar["excursion"][:, 1])
         ),
         "path": np.mean(
-            np.abs(
-                actual_curve
-                - np.expm1(scalar["curve"]) * holdout.current_move_pct[:, None]
-            ),
+            np.abs(actual_curve - np.expm1(scalar["curve"]) * predicted_curve_scale),
             axis=1,
         ),
     }
@@ -1299,8 +1774,7 @@ def comparison_vs_scalar(
             "path": np.mean(
                 np.abs(
                     actual_curve
-                    - np.expm1(neural_direct["curve"])
-                    * holdout.current_move_pct[:, None]
+                    - np.expm1(neural_direct["curve"]) * predicted_curve_scale
                 ),
                 axis=1,
             ),
@@ -1315,8 +1789,7 @@ def comparison_vs_scalar(
                 ),
                 "path": np.mean(
                     np.abs(
-                        actual_curve
-                        - np.expm1(value["curve"]) * holdout.current_move_pct[:, None]
+                        actual_curve - np.expm1(value["curve"]) * predicted_curve_scale
                     ),
                     axis=1,
                 ),
@@ -1347,8 +1820,12 @@ def subgroup_metrics(
     tree: dict[str, np.ndarray],
     retrievals: dict[str, dict[str, np.ndarray]],
 ) -> dict[str, Any]:
-    groups: dict[str, Any] = {"by_asset": {}, "by_direction": {}}
-    for column, destination in (("asset", "by_asset"), ("direction", "by_direction")):
+    groups: dict[str, Any] = {"by_asset": {}, "by_direction": {}, "by_age": {}}
+    for column, destination in (
+        ("asset", "by_asset"),
+        ("direction", "by_direction"),
+        ("age_bucket", "by_age"),
+    ):
         values = holdout.metadata[column].astype(str).to_numpy()
         for value in sorted(set(values)):
             mask = values == value
@@ -1370,7 +1847,7 @@ def markdown_report(summary: dict[str, Any]) -> str:
         "",
         f"Generated: `{summary['generated_at_utc']}`.",
         "",
-        "This is an isolated five-asset 5m challenger. It does not alter the live dashboard.",
+        f"This is an isolated five-asset {summary['data'].get('timeframe', '5m')} challenger. It does not alter the live dashboard.",
         "Every displayed-retrieval candidate remains a real historical continuation; the neural network only learns retrieval relevance.",
         "",
         "## Population and split",
@@ -1401,6 +1878,11 @@ def markdown_report(summary: dict[str, Any]) -> str:
             "Coverage is reported in the JSON together with interval width; coverage alone is not evidence of a sharper forecast.",
             "The neural direct path is diagnostic only. Candidate routes for product use come from the neural or hybrid real-history retrievers.",
             "",
+            "## Evaluation-label integrity",
+            "",
+            "Path metrics use separately retained raw future distances; the stabilized ratio floor and clip are training representations only.",
+            f"Holdout floor-affected rows: **{summary['path_label_integrity']['holdout_floor_affected_rows']}**. Clipped representation cells: **{summary['path_label_integrity']['holdout_clipped_representation_cells']}** across **{summary['path_label_integrity']['holdout_clipped_representation_rows']}** rows.",
+            "",
             "## Scope boundary",
             "",
             "This first experiment remains conditional on clean completed fills because the current path library does not export equivalent unresolved histories.",
@@ -1408,6 +1890,17 @@ def markdown_report(summary: dict[str, Any]) -> str:
             "",
         ]
     )
+    gate = summary.get("deployment_gate")
+    if gate:
+        lines.extend(
+            [
+                "## Experimental live gate",
+                "",
+                f"V3 is eligible only for `{gate['timeframe']}` pins aged {gate['min_elapsed_bars']}–{gate['max_elapsed_bars']} bars; V1 is the fallback everywhere else.",
+                gate["selection_note"],
+                "",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -1430,6 +1923,7 @@ def scale_samples(
             log_remaining=samples.log_remaining,
             log_excursion=samples.log_excursion,
             curve_log_ratio=samples.curve_log_ratio,
+            curve_distance_pct=samples.curve_distance_pct,
             direction_targets=samples.direction_targets,
             current_move_pct=samples.current_move_pct,
             weights=samples.weights,
@@ -1478,14 +1972,21 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=project_root / "data" / "neural_path_v3",
     )
-    parser.add_argument(
-        "--snapshot-offsets", default=",".join(str(value) for value in DEFAULT_OFFSETS)
-    )
+    parser.add_argument("--timeframe", choices=("1m", "5m", "15m"), default="5m")
+    parser.add_argument("--snapshot-offsets")
     parser.add_argument("--train-cap", type=int, default=18_000)
     parser.add_argument("--validation-cap", type=int, default=2_000)
     parser.add_argument("--holdout-cap", type=int, default=1_200)
     parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--retrieval-modes", default=",".join(RETRIEVAL_MODES))
+    parser.add_argument(
+        "--age-balanced",
+        action="store_true",
+        help="Balance row selection and training loss across snapshot-age regimes.",
+    )
+    parser.add_argument("--minimum-offset-bars", type=int, default=1)
+    parser.add_argument("--maximum-offset-bars", type=int)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--smoke", action="store_true")
     return parser.parse_args()
@@ -1493,6 +1994,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    configure_timeframe(args.timeframe)
     default_output_dir = Path(__file__).resolve().parent / "data" / "neural_path_v3"
     output_dir = (
         default_output_dir.with_name("neural_path_v3_smoke")
@@ -1506,6 +2008,13 @@ def main() -> None:
         epochs=2 if args.smoke else args.epochs,
         batch_size=args.batch_size,
         patience=2 if args.smoke else 3,
+        retrieval_modes=parse_retrieval_modes(args.retrieval_modes),
+        age_balanced_sampling=args.age_balanced,
+        age_balanced_loss=args.age_balanced,
+        minimum_offset_bars=args.minimum_offset_bars,
+        maximum_offset_bars=args.maximum_offset_bars,
+        timeframe=args.timeframe,
+        embargo_bars=max(1, int(np.ceil((24 * 60) / BAR_MINUTES))),
     )
     if (
         min(
@@ -1518,6 +2027,13 @@ def main() -> None:
         < 1
     ):
         raise ValueError("row caps, epochs, and batch size must be positive")
+    if config.minimum_offset_bars < 1:
+        raise ValueError("minimum offset must be positive")
+    if (
+        config.maximum_offset_bars is not None
+        and config.maximum_offset_bars < config.minimum_offset_bars
+    ):
+        raise ValueError("maximum offset must not precede minimum offset")
     seed_everything(config.seed)
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
@@ -1530,13 +2046,34 @@ def main() -> None:
         else "cpu"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    print("loading completed 5m episode library", flush=True)
-    events = load_events(args.library_dir)
-    paths = load_paths(args.library_dir, events)
-    snapshots, snapshot_counts = build_snapshot_dataset(
-        events, paths, parse_offsets(args.snapshot_offsets)
+    snapshot_offsets = parse_offsets(
+        args.snapshot_offsets
+        if args.snapshot_offsets is not None
+        else ",".join(str(value) for value in DEFAULT_OFFSETS)
     )
+
+    print(f"loading completed {args.timeframe} episode library", flush=True)
+    events = load_timeframe_library(
+        Path(__file__).resolve().parent, args.library_dir, args.timeframe
+    )
+    required_assets = sorted(set(events["asset"].astype(str)))
+    raw_by_asset = {
+        asset: load_raw_candles(args.data_dir, asset, args.timeframe)
+        for asset in required_assets
+    }
+    snapshots, snapshot_counts = build_snapshot_dataset_from_raw(
+        events, raw_by_asset, snapshot_offsets
+    )
+    snapshots = snapshots.loc[
+        snapshots["offset_bars"].ge(config.minimum_offset_bars)
+    ].copy()
+    if config.maximum_offset_bars is not None:
+        snapshots = snapshots.loc[
+            snapshots["offset_bars"].le(config.maximum_offset_bars)
+        ].copy()
+    if snapshots.empty:
+        raise RuntimeError("No snapshots remain inside the configured age regime")
+    snapshot_counts["snapshot_rows_after_age_regime_filter"] = int(len(snapshots))
     outer_train, holdout_pool, outer_split = chronological_split(
         snapshots,
         events,
@@ -1548,40 +2085,34 @@ def main() -> None:
         validation_fraction=config.validation_fraction,
         embargo_bars=config.embargo_bars,
     )
-    fit_frame = evenly_spaced(fit_pool, config.train_cap)
-    validation_frame = evenly_spaced(validation_pool, config.validation_cap)
-    holdout_frame = evenly_spaced(holdout_pool, config.holdout_cap)
+    cap_rows = age_stratified_cap if config.age_balanced_sampling else evenly_spaced
+    fit_frame = cap_rows(fit_pool, config.train_cap)
+    validation_frame = cap_rows(validation_pool, config.validation_cap)
+    holdout_frame = cap_rows(holdout_pool, config.holdout_cap)
 
-    required_assets = sorted(
-        set(fit_frame["asset"].astype(str))
-        | set(validation_frame["asset"].astype(str))
-        | set(holdout_frame["asset"].astype(str))
+    fit = materialize_samples(
+        fit_frame,
+        events,
+        None,
+        raw_by_asset,
+        "fit",
+        age_balanced_loss=config.age_balanced_loss,
     )
-    raw_by_asset = {
-        asset: load_raw_candles(args.data_dir, asset) for asset in required_assets
-    }
-    selected_ids = set(
-        pd.concat(
-            (
-                fit_frame["episode_id"],
-                validation_frame["episode_id"],
-                holdout_frame["episode_id"],
-            )
-        )
-        .astype(str)
-        .tolist()
-    )
-    selected_paths = paths.loc[
-        paths["episode_id"].astype(str).isin(selected_ids)
-    ].copy()
-    del paths
-
-    fit = materialize_samples(fit_frame, events, selected_paths, raw_by_asset, "fit")
     validation = materialize_samples(
-        validation_frame, events, selected_paths, raw_by_asset, "validation"
+        validation_frame,
+        events,
+        None,
+        raw_by_asset,
+        "validation",
+        age_balanced_loss=config.age_balanced_loss,
     )
     holdout = materialize_samples(
-        holdout_frame, events, selected_paths, raw_by_asset, "holdout"
+        holdout_frame,
+        events,
+        None,
+        raw_by_asset,
+        "holdout",
+        age_balanced_loss=config.age_balanced_loss,
     )
     raw_fit_for_tree = fit
     raw_holdout_for_tree = holdout
@@ -1596,21 +2127,18 @@ def main() -> None:
     tree_predictions = fit_tree_quantiles(
         raw_fit_for_tree, raw_holdout_for_tree, config.seed
     )
-    retrievals = {
-        f"{mode}_real_path_retrieval": retrieve_predictions(
-            fit,
-            holdout,
-            raw_fit_for_tree.static,
-            raw_holdout_for_tree.static,
-            fit_predictions["embedding"],
-            holdout_predictions["embedding"],
-            holdout_predictions,
-            config.retrieval_neighbors,
-            config.candidate_pool,
-            mode,
-        )
-        for mode in ("scalar", "neural", "hybrid", "forecast", "forecast_hybrid")
-    }
+    retrievals = retrieve_predictions(
+        fit,
+        holdout,
+        raw_fit_for_tree.static,
+        raw_holdout_for_tree.static,
+        fit_predictions["embedding"],
+        holdout_predictions["embedding"],
+        holdout_predictions,
+        config.retrieval_neighbors,
+        config.candidate_pool,
+        config.retrieval_modes,
+    )
     metrics = evaluate_predictions(
         holdout, holdout_predictions, tree_predictions, retrievals
     )
@@ -1629,7 +2157,7 @@ def main() -> None:
         "generated_at_utc": utc_now(),
         "purpose": "learn predictive prefix structure while preserving real historical continuations",
         "status": "research challenger; not connected to the live dashboard",
-        "conditional_population": "strict five-asset 5m clean-fill episodes only",
+        "conditional_population": f"strict five-asset {args.timeframe} clean-fill episodes only",
         "config": asdict(config),
         "environment": {
             "python": sys.version.split()[0],
@@ -1643,6 +2171,7 @@ def main() -> None:
             "episode": list(EPISODE_SEQUENCE_CHANNELS),
             "static": list(STATIC_COLUMNS),
             "future_horizon_bars": FUTURE_HORIZON_BARS.tolist(),
+            "direction_horizon_bars": DIRECTION_HORIZON_BARS.tolist(),
         },
         "data": {
             **snapshot_counts,
@@ -1653,10 +2182,38 @@ def main() -> None:
             "holdout_rows": len(holdout_frame),
             "holdout_episodes": int(holdout_frame["episode_id"].nunique()),
             "assets": required_assets,
+            "timeframe": args.timeframe,
+            "bar_minutes": BAR_MINUTES,
+            "pre_signal_source_bars": PRE_SIGNAL_SOURCE_BARS,
+            "recent_source_bars": RECENT_SOURCE_BARS,
+            "snapshot_offsets_bars": snapshot_offsets,
         },
         "outer_chronological_split": outer_split,
         "inner_chronological_split": inner_split,
         "training": {"best_epoch": best_epoch, "history": history},
+        "path_label_integrity": {
+            "evaluation_truth": "raw future distance-to-target percentages before model floor or clipping",
+            "denominator_floor_pct": 0.02,
+            "training_ratio_clip": 25.0,
+            "holdout_floor_affected_rows": int(np.sum(holdout.current_move_pct < 0.02)),
+            "holdout_clipped_representation_rows": int(
+                np.sum(
+                    np.any(
+                        holdout.curve_distance_pct
+                        / curve_denominator(holdout.current_move_pct)[:, None]
+                        > 25.0,
+                        axis=1,
+                    )
+                )
+            ),
+            "holdout_clipped_representation_cells": int(
+                np.sum(
+                    holdout.curve_distance_pct
+                    / curve_denominator(holdout.current_move_pct)[:, None]
+                    > 25.0
+                )
+            ),
+        },
         "holdout_metrics": metrics,
         "subgroup_holdout_metrics": groups,
         "episode_clustered_comparison_vs_scalar": paired_comparisons,
@@ -1676,6 +2233,14 @@ def main() -> None:
         },
         "scalers": scalers,
         "channels": summary["channels"],
+        "static_columns": list(STATIC_COLUMNS),
+        "future_horizon_bars": FUTURE_HORIZON_BARS.tolist(),
+        "direction_horizon_bars": DIRECTION_HORIZON_BARS.tolist(),
+        "snapshot_offsets_bars": snapshot_offsets,
+        "timeframe": args.timeframe,
+        "bar_minutes": BAR_MINUTES,
+        "pre_signal_source_bars": PRE_SIGNAL_SOURCE_BARS,
+        "recent_source_bars": RECENT_SOURCE_BARS,
     }
     torch.save(checkpoint, output_dir / "neural_path_v3_model.pt")
     np.savez_compressed(
@@ -1684,65 +2249,46 @@ def main() -> None:
         curve_log_ratio=fit.curve_log_ratio.astype(np.float16),
         log_remaining=fit.log_remaining.astype(np.float32),
         log_excursion=fit.log_excursion.astype(np.float32),
-        episode_id=fit.metadata["episode_id"].astype(str).to_numpy(),
+        raw_static=raw_fit_for_tree.static.astype(np.float32),
+        episode_id=fit.metadata["episode_id"].to_numpy(dtype=str),
+        asset=fit.metadata["asset"].to_numpy(dtype=str),
+        direction=fit.metadata["direction"].to_numpy(dtype=str),
         offset_bars=fit.metadata["offset_bars"].to_numpy(dtype=np.int32),
+        snapshot_close_time_ms=fit.metadata["snapshot_close_time_ms"].to_numpy(
+            dtype=np.int64
+        ),
+        fill_close_time_ms=fit.metadata["fill_close_time_ms"].to_numpy(dtype=np.int64),
     )
+    holdout_artifact: dict[str, np.ndarray] = {
+        "episode_id": holdout.metadata["episode_id"].to_numpy(dtype=str),
+        "asset": holdout.metadata["asset"].to_numpy(dtype=str),
+        "direction": holdout.metadata["direction"].to_numpy(dtype=str),
+        "actual_log_remaining": holdout.log_remaining.astype(np.float32),
+        "actual_log_excursion": holdout.log_excursion.astype(np.float32),
+        "actual_curve_log_ratio": holdout.curve_log_ratio.astype(np.float32),
+        "actual_curve_distance_pct": holdout.curve_distance_pct.astype(np.float32),
+        "current_move_pct": holdout.current_move_pct.astype(np.float32),
+        "neural_direct_risk": holdout_predictions["risk"].astype(np.float32),
+        "neural_direct_curve": holdout_predictions["curve"].astype(np.float32),
+    }
+    for name, predictions in retrievals.items():
+        prefix = name.removesuffix("_real_path_retrieval")
+        holdout_artifact[f"{prefix}_remaining"] = predictions["remaining"].astype(
+            np.float32
+        )
+        holdout_artifact[f"{prefix}_excursion"] = predictions["excursion"].astype(
+            np.float32
+        )
+        holdout_artifact[f"{prefix}_curve"] = predictions["curve"].astype(np.float32)
+        holdout_artifact[f"{prefix}_selected_episode_id"] = predictions[
+            "selected_episode_id"
+        ].astype(str)
+        holdout_artifact[f"{prefix}_selected_offset_bars"] = predictions[
+            "selected_offset_bars"
+        ].astype(np.int32)
     np.savez_compressed(
         output_dir / "neural_path_v3_holdout_arrays.npz",
-        actual_log_remaining=holdout.log_remaining.astype(np.float32),
-        actual_log_excursion=holdout.log_excursion.astype(np.float32),
-        actual_curve_log_ratio=holdout.curve_log_ratio.astype(np.float32),
-        current_move_pct=holdout.current_move_pct.astype(np.float32),
-        neural_direct_risk=holdout_predictions["risk"].astype(np.float32),
-        neural_direct_curve=holdout_predictions["curve"].astype(np.float32),
-        scalar_remaining=retrievals["scalar_real_path_retrieval"]["remaining"].astype(
-            np.float32
-        ),
-        scalar_excursion=retrievals["scalar_real_path_retrieval"]["excursion"].astype(
-            np.float32
-        ),
-        scalar_curve=retrievals["scalar_real_path_retrieval"]["curve"].astype(
-            np.float32
-        ),
-        neural_remaining=retrievals["neural_real_path_retrieval"]["remaining"].astype(
-            np.float32
-        ),
-        neural_excursion=retrievals["neural_real_path_retrieval"]["excursion"].astype(
-            np.float32
-        ),
-        neural_curve=retrievals["neural_real_path_retrieval"]["curve"].astype(
-            np.float32
-        ),
-        hybrid_remaining=retrievals["hybrid_real_path_retrieval"]["remaining"].astype(
-            np.float32
-        ),
-        hybrid_excursion=retrievals["hybrid_real_path_retrieval"]["excursion"].astype(
-            np.float32
-        ),
-        hybrid_curve=retrievals["hybrid_real_path_retrieval"]["curve"].astype(
-            np.float32
-        ),
-        forecast_remaining=retrievals["forecast_real_path_retrieval"][
-            "remaining"
-        ].astype(np.float32),
-        forecast_excursion=retrievals["forecast_real_path_retrieval"][
-            "excursion"
-        ].astype(np.float32),
-        forecast_curve=retrievals["forecast_real_path_retrieval"]["curve"].astype(
-            np.float32
-        ),
-        forecast_hybrid_remaining=retrievals["forecast_hybrid_real_path_retrieval"][
-            "remaining"
-        ].astype(np.float32),
-        forecast_hybrid_excursion=retrievals["forecast_hybrid_real_path_retrieval"][
-            "excursion"
-        ].astype(np.float32),
-        forecast_hybrid_curve=retrievals["forecast_hybrid_real_path_retrieval"][
-            "curve"
-        ].astype(np.float32),
-        episode_id=holdout.metadata["episode_id"].astype(str).to_numpy(),
-        asset=holdout.metadata["asset"].astype(str).to_numpy(),
-        direction=holdout.metadata["direction"].astype(str).to_numpy(),
+        **holdout_artifact,
     )
     prediction_rows = holdout.metadata.copy()
     prediction_rows["actual_remaining_bars"] = np.expm1(holdout.log_remaining)
@@ -1760,6 +2306,13 @@ def main() -> None:
         prediction_rows[f"{model_name}_excursion_p50"] = np.expm1(
             predictions["excursion"][:, 1]
         )
+        if "selected_episode_id" in predictions:
+            prediction_rows[f"{model_name}_selected_episode_id"] = predictions[
+                "selected_episode_id"
+            ]
+            prediction_rows[f"{model_name}_selected_offset_bars"] = predictions[
+                "selected_offset_bars"
+            ]
     prediction_rows.to_csv(
         output_dir / "neural_path_v3_holdout_predictions.csv", index=False
     )
