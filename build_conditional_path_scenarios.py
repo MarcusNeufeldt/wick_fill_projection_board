@@ -472,8 +472,12 @@ def empirical_percentile(values: np.ndarray, value: float) -> float:
     return float(np.mean(values <= value))
 
 
-def projected_coordinate_matches(matches: pd.DataFrame, current_move_pct: float) -> pd.DataFrame:
-    """Map each comparable future excursion into the pinned wick's price coordinates before ranking it."""
+def projected_coordinate_matches(
+    matches: pd.DataFrame,
+    current_move_pct: float,
+    current_direction_sign: int = 1,
+) -> pd.DataFrame:
+    """Map comparable excursions into live coordinates and entry-price risk."""
     value = matches.copy()
     historical_move = value["alignment_current_move_pct"].to_numpy(dtype=float)
     if np.any(historical_move <= 0):
@@ -484,7 +488,14 @@ def projected_coordinate_matches(matches: pd.DataFrame, current_move_pct: float)
     value["normalization_scale"] = scale
     value["historical_future_max_away_move_pct"] = historical_future
     value["projected_future_max_away_move_pct"] = projected_future
-    value["projected_additional_adverse_move_pct"] = np.maximum(0.0, projected_future - float(current_move_pct))
+    entry_denominator = 100.0 + current_direction_sign * float(current_move_pct)
+    if entry_denominator <= 0.0:
+        raise RuntimeError("Current entry price must remain positive")
+    value["projected_additional_adverse_move_pct"] = (
+        np.maximum(0.0, projected_future - float(current_move_pct))
+        * 100.0
+        / entry_denominator
+    )
     return value
 
 
@@ -637,9 +648,17 @@ def projected_path_metrics(
     else:
         directional_values = [(1.0 - float(candle["low"]) / current_target) * 100.0 for candle in candles]
     future_peak = max(0.0, max(directional_values))
+    entry_denominator = 100.0 + current_direction_sign * float(current_move_pct)
+    if entry_denominator <= 0.0:
+        raise RuntimeError("Current entry price must remain positive")
     return {
         "projected_future_max_away_move_pct": round(float(future_peak), 8),
-        "projected_additional_adverse_move_pct": round(max(0.0, float(future_peak) - current_move_pct), 8),
+        "projected_additional_adverse_move_pct": round(
+            max(0.0, float(future_peak) - current_move_pct)
+            * 100.0
+            / entry_denominator,
+            8,
+        ),
     }
 
 
@@ -724,7 +743,11 @@ def project_at(
         archetype_pool_size=archetype_pool_size,
         archetype_blend_weight=archetype_blend_weight,
     )
-    matched_states = projected_coordinate_matches(matched_states, current_state["current_move_pct"])
+    matched_states = projected_coordinate_matches(
+        matched_states,
+        current_state["current_move_pct"],
+        current_direction_sign,
+    )
     cohort = matched_states.head(min(top_k, len(matched_states))).copy()
     if len(cohort) < 12:
         return {

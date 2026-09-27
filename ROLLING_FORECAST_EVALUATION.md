@@ -153,11 +153,11 @@ Adding support variables to E0 produced no reliable risk or wait gain. It change
 Numerical fill probability     -> E0 validation-trained prediction stack
 Numerical adverse risk         -> E0 validation-trained prediction stack
 Numerical waiting time         -> A existing supervised model
-Historical illustrated routes -> C2 dynamic weighted retrieval
+Historical illustrated routes -> C2 candidates aligned to E0/A time-risk targets
 Historical support            -> separate OOD/difficulty disclosure
 ```
 
-This is still research-only. Before promotion, E0 needs a production artifact contract, a newly accumulated future-period check, and dashboard wording that keeps route illustrations separate from numerical forecasts. Fold-local V3 is now lower priority than operationalizing and prospectively validating this simpler architecture.
+This composition is now installed as frozen 5m architecture `forecast_architecture_v1_5m_2026-09-27` for prospective validation. Adaptive route candles select real completed C2 continuations close to the frozen E0/A time-risk targets; they remain illustrations and are evaluated separately from the numerical forecasts. Fold-local V3 is lower priority and the dashboard exposes it only as a legacy comparison.
 
 ## Interpretation boundary
 

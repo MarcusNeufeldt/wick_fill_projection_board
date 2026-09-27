@@ -208,6 +208,156 @@ class ForecastArchitectureTests(unittest.TestCase):
             prediction["historical_support"]["1440m"]["level"],
             {"very_high", "high", "medium", "low", "very_low"},
         )
+        route_candidates = prediction["historical_route_candidates"]["1440m"]
+        self.assertEqual([item["episode_id"] for item in route_candidates], ["a", "b"])
+        self.assertEqual(route_candidates[0]["neighbor_rank"], 1)
+        self.assertEqual(route_candidates[0]["wait_minutes"], 60.0)
+
+    def test_c2_route_engine_selects_four_real_historical_suffixes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            engine = Engine(Path(directory))
+            frame = pd.DataFrame(
+                {
+                    "close_time": [10_000],
+                    "close": [102.0],
+                }
+            )
+            signal = pd.DataFrame(
+                [
+                    {
+                        "open_time": 1_000,
+                        "wick_target": 100.0,
+                        "direction_sign": 1,
+                        "interval_minutes": 5,
+                    }
+                ]
+            )
+            horizon_waits = {
+                "1440m": [60.0, 90.0, 120.0, 150.0],
+                "10080m": [300.0, 450.0, 600.0, 750.0],
+                "43200m": [1_500.0, 2_500.0, 3_500.0, 4_500.0],
+            }
+            candidates: dict[str, list[dict]] = {}
+            episode_rows = []
+            state_rows = []
+            spans = {}
+            for horizon_index, (slug, waits) in enumerate(horizon_waits.items()):
+                candidates[slug] = []
+                for item_index, wait in enumerate(waits):
+                    episode_id = f"episode_{horizon_index}_{item_index}"
+                    candidates[slug].append(
+                        {
+                            "episode_id": episode_id,
+                            "asset": "ETHUSDT",
+                            "distance": 0.1 + item_index * 0.01,
+                            "neighbor_rank": item_index + 1,
+                            "wait_minutes": wait,
+                            "adverse_pct": 1.0,
+                        }
+                    )
+                    episode_rows.append(
+                        {"episode_id": episode_id, "fill_close_time_ms": 9_000}
+                    )
+                    row_index = len(state_rows)
+                    state_rows.append(
+                        {
+                            "episode_id": episode_id,
+                            "asset": "ETHUSDT",
+                            "timeframe": "5m",
+                            "direction": "lower_wick",
+                            "offset_bars": 1,
+                            "remaining_to_fill_bars": int(wait / 5.0),
+                            "alignment_current_move_pct": 2.0,
+                            "alignment_peak_move_pct": 3.0,
+                            "alignment_drawdown_pct": 1.0,
+                            "future_peak_move_pct": 3.0,
+                        }
+                    )
+                    state_rows.append(
+                        {
+                            "episode_id": episode_id,
+                            "offset_bars": 2,
+                            "normalized_open_pct": 4.1,
+                            "normalized_high_pct": 4.2,
+                            "normalized_low_pct": 4.0,
+                            "normalized_close_pct": 4.1,
+                        }
+                    )
+                    spans[episode_id] = (row_index, row_index + 2)
+            risk = {
+                "artifact": {
+                    "forecast_source": "forecast_v1",
+                    "architecture_version": ARCHITECTURE_ID,
+                    "artifact_sha256": "a" * 64,
+                },
+                "remaining_time_minutes_if_filled_within_horizon": {
+                    "1440m": {"p10": 90.0, "p50": 105.0},
+                    "10080m": {"p50": 450.0},
+                    "43200m": {"p90": 2_500.0},
+                },
+                "additional_adverse_pct": {
+                    "1440m": {"p50": 1.0, "p80": 2.0},
+                    "10080m": {"p50": 1.0},
+                    "43200m": {"p90": 1.0},
+                },
+            }
+            projection = {
+                "current_state": {"current_move_pct": 2.0},
+                "library": {},
+                "scenarios": [],
+            }
+            candles = [
+                {"time": 1, "open": 102.0, "high": 105.0, "low": 102.0, "close": 104.0},
+                {"time": 301, "open": 104.0, "high": 104.0, "low": 100.0, "close": 100.0},
+            ]
+            with (
+                patch.object(engine, "_frame", return_value=frame),
+                patch.object(engine, "_signals", return_value=signal),
+                patch.object(
+                    engine,
+                    "_library_states",
+                    return_value=(
+                        pd.DataFrame(episode_rows),
+                        pd.DataFrame(state_rows),
+                        None,
+                        spans,
+                    ),
+                ),
+                patch(
+                    "serve_conditional_wick_dashboard.projected_candles",
+                    return_value=(candles, 1.0),
+                ),
+                patch(
+                    "serve_conditional_wick_dashboard.projected_path_metrics",
+                    return_value={
+                        "projected_future_max_away_move_pct": 3.0,
+                        "projected_additional_adverse_move_pct": 1.0,
+                    },
+                ),
+            ):
+                result = engine._apply_c2_numerical_routes(
+                    "ETHUSDT", "5m", 1_000, projection, risk, candidates
+                )
+
+        self.assertTrue(result["active"])
+        self.assertEqual(
+            [scenario["name"] for scenario in projection["scenarios"]],
+            ["fast", "normal", "adverse", "extreme"],
+        )
+        self.assertTrue(
+            all(
+                scenario["selector"] == "c2_e0_a_numerical_aligned_real_path"
+                for scenario in projection["scenarios"]
+            )
+        )
+        adverse = next(
+            scenario
+            for scenario in projection["scenarios"]
+            if scenario["name"] == "adverse"
+        )
+        self.assertEqual(adverse["adverse_first_threshold_pct"], 2.0)
+        self.assertEqual(adverse["projected_adverse_threshold_bars"], 1)
+        self.assertEqual(adverse["projected_adverse_ordering"], "adverse_before_fill")
 
     def test_dashboard_prefers_frozen_5m_artifact_without_affecting_1m(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

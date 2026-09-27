@@ -113,7 +113,7 @@ LIVE_SOURCE_SPECS = tuple((asset, "5m", asset) for asset in ASSETS) + tuple(
     (asset, "1m", f"{asset}_1m") for asset in ASSETS
 )
 VISUAL_TIMEFRAMES = ("1m", "5m", "15m", "30m")
-MATCHING_MODES = ("adaptive", "blended", "archetype")
+MATCHING_MODES = ("adaptive", "legacy_v3", "blended", "archetype")
 V3_LIVE_ARTIFACT_DIRS = {
     "1m": ("neural_path_v3_1m_fresh", "neural_path_v3_1m_mature"),
     "5m": ("neural_path_v3_5m_fresh", "neural_path_v3_5m_mature"),
@@ -446,14 +446,14 @@ HTML = r"""<!doctype html>
 <body>
   <main>
     <header>
-      <div><div class="eyebrow">conditional wick-fill instrument · v1</div><h1>Pin a wick. Inspect real historical paths.</h1><p class="sub">Choose an unfilled strict wick candle. The engine matches its live state against completed historical episodes, then draws three actual, rescaled candle paths to the wick target.</p></div>
+      <div><div class="eyebrow">conditional wick-fill instrument · v1</div><h1>Pin a wick. Inspect real historical paths.</h1><p class="sub">Choose an unfilled strict wick candle. The engine matches its live state against completed historical episodes, then draws real rescaled candle paths—including a dedicated adverse-first risk route—to the wick target.</p></div>
       <div class="stamp" id="asOf">Loading data snapshot…</div>
     </header>
     <form class="control" id="controls">
       <label>Asset<select id="asset"><option>ETHUSDT</option><option>BTCUSDT</option><option>SOLUSDT</option><option>UNIUSDT</option><option>NEARUSDT</option></select></label>
       <label>Timeframe<select id="timeframe"><option>5m</option><option>15m</option><option value="1m">1m</option></select></label>
       <label>Display candles<select id="displayTimeframe"><option value="5m">5m native</option><option value="15m">15m visual</option><option value="30m">30m visual</option></select></label>
-      <label>Matcher<select id="matchingMode"><option value="adaptive">Adaptive live path</option><option value="blended">Soft archetype blend</option><option value="archetype">Hard candle archetype</option></select></label>
+      <label>Matcher<select id="matchingMode"><option value="adaptive">Adaptive live path</option><option value="legacy_v3">Legacy V3 comparison</option><option value="blended">Soft archetype blend</option><option value="archetype">Hard candle archetype</option></select></label>
       <label>Recent unfilled wick<select id="signalPicker" aria-label="Recent unfilled strict wick signals"><option value="">Loading candidates…</option></select></label>
       <label>Signal time (UTC)<input id="signalTime" spellcheck="false" value="2026-09-16T18:35:00Z" aria-describedby="timeHelp"></label>
       <button id="project" type="submit">Project paths</button>
@@ -469,8 +469,8 @@ HTML = r"""<!doctype html>
   </main>
   <script>
   (() => {
-    const colors={fast:'#38b7a6',normal:'#9497f8',extreme:'#dc7954'};
-    const labels={fast:'Fast',normal:'Normal',extreme:'Extreme'};
+    const colors={fast:'#38b7a6',normal:'#9497f8',adverse:'#e8b44f',extreme:'#dc7954'};
+    const labels={fast:'Fast',normal:'Normal',adverse:'Adverse first',extreme:'Extreme'};
     let data=null, chart=null, actual=null, projected=null, aggregated=null, liveCandleSeries=null, targetLine=null, targetLineSeries=null, selectedScenario='normal', lastDisplayBarCount=0, pendingFitFrame=0;
     let refreshStatus=null, knownSelectedSourceVersion=null, projectionInFlight=false, projectionRefreshQueued=false, liveSocket=null, liveSocketKey=null, liveSocketGeneration=0, liveReconnectTimer=0, liveCloseRefreshTimer=0, liveCandle=null, liveFeedState='idle';
     const q=id=>document.getElementById(id);
@@ -687,7 +687,8 @@ HTML = r"""<!doctype html>
       const color=colors[name]; projected.applyOptions({upColor:color,downColor:color,borderUpColor:color,borderDownColor:color,wickUpColor:color,wickDownColor:color}); const display=renderCandleSeries(item,color);
       q('chartTitle').textContent=`${labels[name]} route — conditional historical trajectory`;
       const terminalSeconds=item.projected_terminal_fill_candle_utc?Date.parse(item.projected_terminal_fill_candle_utc)/1000:item.projected_candles.at(-1).time+Number(data.pinned_signal.timeframe.replace('m',''))*60;
-      q('chartNote').textContent=`${duration(item.remaining_to_fill_bars)} remaining · ${item.historical_asset} ${item.historical_timeframe} analogue · terminal wick touch ${berlin(terminalSeconds)}`;
+      const adverseNote=name==='adverse'&&item.projected_adverse_threshold_candle_utc?` · p80 adverse reached ${berlin(Date.parse(item.projected_adverse_threshold_candle_utc)/1000)} before fill`:'';
+      q('chartNote').textContent=`${duration(item.remaining_to_fill_bars)} remaining · ${item.historical_asset} ${item.historical_timeframe} analogue${adverseNote} · terminal wick touch ${berlin(terminalSeconds)}`;
       if(display.isAggregated){
         const boundaryNote=display.hasTransition?' · amber boundary candle blends observed and projected '+data.pinned_signal.timeframe+' candles.':'';
         q('chartTitle').textContent=labels[name]+' route — '+display.displayMinutes+'m visual aggregation';
@@ -713,7 +714,7 @@ HTML = r"""<!doctype html>
       const blocks=Object.entries(labels).map(([key,label])=>{
         const fill=risk.fill_probability?.[key], adverse=risk.additional_adverse_pct?.[key], wait=risk.remaining_time_minutes_if_filled_within_horizon?.[key];
         if(fill==null||!adverse||!wait)return '';
-        return `<div class="v2-block"><span>${label}: fill odds / additional adverse <em>p50 / p90</em></span><strong>${share(fill)} <i>Â·</i> ${pct(adverse.p50)} <i>/</i> ${pct(adverse.p90)}</strong><i>Wait if filled inside ${label}: ${durationMinutes(wait.p10)} / ${durationMinutes(wait.p50)} / ${durationMinutes(wait.p90)} (p10 / p50 / p90)</i></div>`;
+        return `<div class="v2-block"><span>${label}: fill odds / additional adverse <em>p50 / p80 / p90</em></span><strong>${share(fill)} <i>Â·</i> ${pct(adverse.p50)} <i>/</i> ${pct(adverse.p80)} <i>/</i> ${pct(adverse.p90)}</strong><i>Wait if filled inside ${label}: ${durationMinutes(wait.p10)} / ${durationMinutes(wait.p50)} / ${durationMinutes(wait.p90)} (p10 / p50 / p90)</i></div>`;
       }).join('');
       const historicalSupport=risk.historical_support||{};
       const supportBlocks=Object.entries(labels).map(([key,label])=>{
@@ -725,8 +726,9 @@ HTML = r"""<!doctype html>
         const familiarity=Math.max(0,100-Math.round(Number(item.median_distance_percentile||0)*100));
         return `<div class="v2-block"><span>${label} historical support</span><strong>${level}</strong><i>${effective} effective analogues; ${agreement} outcome agreement; familiarity percentile ${familiarity}%.</i></div>`;
       }).join('');
-      const contest=risk.competing_outcomes?.['43200m_vs_5pct']||{};
-      const contestBlock=contest.target_first==null?'':`<div class="v2-block"><span>Within 30d: wick target versus another 5% adverse move</span><strong>${share(contest.target_first)} target first <i>/</i> ${share(contest.adverse_first||0)} adverse first</strong><i>${share(contest.ambiguous_intrabar||0)} same-candle ordering unknown; ${share(contest.neither||0)} neither inside 30d.</i></div>`;
+      const contest2=risk.competing_outcomes?.['1440m_vs_2pct']||{}, contest5=risk.competing_outcomes?.['43200m_vs_5pct']||{};
+      const contestLine=(contest,label)=>contest.target_first==null?'':`<div class="v2-block"><span>${label}</span><strong>${share(contest.target_first)} target first <i>/</i> ${share(contest.adverse_first||0)} adverse first</strong><i>${share(contest.ambiguous_intrabar||0)} same-candle ordering unknown; ${share(contest.neither||0)} neither inside the horizon.</i></div>`;
+      const contestBlock=contestLine(contest2,'Within 1d: wick target versus another 2% adverse move')+contestLine(contest5,'Within 30d: wick target versus another 5% adverse move');
       const support=risk.support||{}, supportWarning=support.status==='outside_trained_age_range'?`<div class="v2-caution">This pin is ${durationMinutes(risk.entry_age_minutes)} old, outside the trained age range ${durationMinutes(support.entry_age_minutes_min)}â€“${durationMinutes(support.entry_age_minutes_max)}. Treat this as extrapolation.</div>`:'';
       const model=risk.holdout?.model||{}, baseline=risk.holdout?.baseline||{}, improvement=field=>model[field]!=null&&baseline[field]?`${((baseline[field]-model[field])/baseline[field]*100).toFixed(1)}%`:null;
       const evidence=[improvement('risk_interval_mae_pct')&&`risk ${improvement('risk_interval_mae_pct')}`,improvement('time_mae_minutes')&&`wait ${improvement('time_mae_minutes')}`,improvement('fill_brier')&&`fill odds ${improvement('fill_brier')}`].filter(Boolean).join(' Â· ');
@@ -770,8 +772,8 @@ HTML = r"""<!doctype html>
       actual.setData(data.actual_candles); setTargetLine(actual);
       const routes=q('routes'); routes.replaceChildren();
       const preferredScenario=data.scenarios.some(item=>item.name===selectedScenario)?selectedScenario:'normal';
-      data.scenarios.forEach((item,index)=>{const button=document.createElement('button');button.type='button';button.className='route';button.dataset.name=item.name;button.style.setProperty('--route',colors[item.name]);button.style.setProperty('--rail',`${Math.max(8,Math.min(100,item.joint_risk_score_percentile*100))}%`);button.setAttribute('aria-pressed',String(index===1));button.innerHTML=`<div class="route-top"><b>${labels[item.name]}</b><span>risk score p${Math.round(item.joint_risk_score_percentile*100)}</span></div><p>${item.description}</p><div class="route-metrics"><div><label>to wick touch</label><strong>${duration(item.remaining_to_fill_bars)}</strong></div><div><label>projected peak away</label><strong>${pct(item.projected_future_max_away_move_pct)}</strong></div><div><label>tail ≥ this</label><strong>${share(item.matched_cohort_tail_at_or_above_fraction)}</strong></div></div>`;button.addEventListener('click',()=>selectScenario(item.name));routes.append(button);});
-      const v3=data.v3_route||{}, matching=data.matching||{}, normalSelector=matching.mode==='archetype'?`Hard archetype · ${count(matching.signal_configuration_pool_size)} candles`:matching.mode==='blended'?`Soft shape blend · ${Math.round((matching.archetype_blend_weight||0)*100)}%`:v3.active?`V3 ${v3.regime_label||'neural'} · ${count(v3.fit_rows)} fit states`:'V1 historical';
+      data.scenarios.forEach((item,index)=>{const button=document.createElement('button');button.type='button';button.className='route';button.dataset.name=item.name;button.style.setProperty('--route',colors[item.name]||'#ffffff');button.style.setProperty('--rail',`${Math.max(8,Math.min(100,item.joint_risk_score_percentile*100))}%`);button.setAttribute('aria-pressed',String(index===1));const cohortCount=Math.round((item.matched_cohort_tail_at_or_above_fraction||0)*(item.matched_cohort_size||0));const thirdMetric=item.name==='adverse'?`<div><label>p80 adverse reached</label><strong>${item.projected_adverse_threshold_bars?duration(item.projected_adverse_threshold_bars):'not reached'}</strong></div>`:`<div><label>cohort slower/riskier</label><strong>${cohortCount} / ${count(item.matched_cohort_size)} (${share(item.matched_cohort_tail_at_or_above_fraction)})</strong></div>`;const routeBadge=item.name==='adverse'?'p80 adverse-first example':`risk score p${Math.round(item.joint_risk_score_percentile*100)}`;button.innerHTML=`<div class="route-top"><b>${labels[item.name]||item.name}</b><span>${routeBadge}</span></div><p>${item.description}</p><div class="route-metrics"><div><label>to wick touch</label><strong>${duration(item.remaining_to_fill_bars)}</strong></div><div><label>additional adverse</label><strong>${pct(item.projected_additional_adverse_move_pct||0)}</strong></div>${thirdMetric}</div>`;button.addEventListener('click',()=>selectScenario(item.name));routes.append(button);});
+      const v3=data.v3_route||{}, routeEngine=data.route_engine||{}, matching=data.matching||{}, normalSelector=matching.mode==='archetype'?`Hard archetype · ${count(matching.signal_configuration_pool_size)} candles`:matching.mode==='blended'?`Soft shape blend · ${Math.round((matching.archetype_blend_weight||0)*100)}%`:routeEngine.active?`C2 + E0/A · ${count(routeEngine.normal_candidate_count)} routes`:v3.active?`Legacy V3 ${v3.regime_label||'neural'} · ${count(v3.fit_rows)} fit states`:'V1 historical';
       const stateRows=[['Direction',data.pinned_signal.direction.replace('_',' ')],['Current move away',pct(data.current_state.current_move_pct)],['Peak move away',pct(data.current_state.peak_move_pct)],['Drawdown from peak',pct(data.current_state.drawdown_from_peak_pct)],['Elapsed',`${Math.round(data.current_state.elapsed_minutes/60)}h`],['Normal selector',normalSelector],['Wick direction rule',matching.direction_policy||'category-aware'],[`Matched ${data.pinned_signal.timeframe} paths`,count(data.library?.top_k_state_matched_episodes)],['Cohort P50 remaining',`${Math.round(data.cohort_distribution.remaining_time_to_fill_minutes.p50/60)}h`]];
       q('state').innerHTML=stateRows.map(([k,v])=>`<div class="metric"><span>${k}</span><b>${v}</b></div>`).join('');
       renderProspective(data.prospective_risk,data.v2_risk);
@@ -783,7 +785,7 @@ HTML = r"""<!doctype html>
       if(projectionInFlight){projectionRefreshQueued=projectionRefreshQueued||sourceRefresh;return;}
       projectionInFlight=true;
       const asset=q('asset').value, timeframe=q('timeframe').value, display_timeframe=q('displayTimeframe').value, matching_mode=q('matchingMode').value, signal_time=q('signalTime').value.trim();
-      q('project').disabled=true; setStatus('Searching resolved historical paths and rebuilding three real candle scenarios…');
+      q('project').disabled=true; setStatus('Searching resolved historical paths and rebuilding real candle scenarios…');
       try { const response=await fetch(`/api/scenarios?asset=${encodeURIComponent(asset)}&timeframe=${encodeURIComponent(timeframe)}&display_timeframe=${encodeURIComponent(display_timeframe)}&matching_mode=${encodeURIComponent(matching_mode)}&signal_time=${encodeURIComponent(signal_time)}`,{cache:'no-store'}); const payload=await response.json(); if(!response.ok)throw new Error(payload.error||'Request failed'); render(payload,{preserveViewport:sourceRefresh}); const asOf=payload.current_state?.as_of_close_time_utc||'the latest completed candle'; const verb=sourceRefresh?'Refreshed path':'Loaded'; setStatus(`${verb} ${payload.pinned_signal.asset} ${payload.pinned_signal.timeframe} ${payload.pinned_signal.direction.replace('_',' ')} pinned at ${payload.pinned_signal.signal_open_time_utc}; projection as of ${asOf}.`); }
       catch(error){setStatus(error.message||String(error),true);}
       finally{q('project').disabled=false;projectionInFlight=false;if(projectionRefreshQueued){projectionRefreshQueued=false;request({sourceRefresh:true});}}
@@ -1410,6 +1412,436 @@ class Engine:
                 "reason": f"V3 fell back to V1: {type(error).__name__}: {error}",
             }
 
+    def _apply_c2_numerical_routes(
+        self,
+        asset: str,
+        timeframe: str,
+        signal_time_ms: int,
+        projection: dict[str, Any],
+        risk: dict[str, Any],
+        candidates_by_horizon: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Select real C2 continuations close to the frozen E0/A time-risk targets."""
+        if timeframe != "5m":
+            return {
+                "available": False,
+                "active": False,
+                "reason": "Numerically aligned C2 routes are currently frozen for 5m only.",
+            }
+        artifact = risk.get("artifact", {})
+        if artifact.get("forecast_source") != "forecast_v1":
+            return {
+                "available": False,
+                "active": False,
+                "reason": "The frozen 5m E0/A/C2 artifact is unavailable; V1 routes remain visible.",
+            }
+        try:
+            frame = self._frame(asset, timeframe)
+            signals = self._signals(asset, timeframe, frame)
+            matches = signals.loc[signals["open_time"].eq(signal_time_ms)]
+            if len(matches) != 1:
+                raise ValueError("Pinned candle is not a unique strict wick signal")
+            signal = matches.iloc[0]
+            current_index = len(frame) - 1
+            snapshot_close_time_ms = int(frame["close_time"].iat[current_index])
+            target = float(signal["wick_target"])
+            direction_sign = int(signal["direction_sign"])
+            current_move_pct = float(projection["current_state"]["current_move_pct"])
+            episodes, path_states, _, path_spans = self._library_states(asset, timeframe)
+            event_by_id = {
+                str(row.episode_id): row for row in episodes.itertuples(index=False)
+            }
+            route_specs = (
+                (
+                    "fast",
+                    "1440m",
+                    "p10",
+                    "p50",
+                    0.55,
+                    0.35,
+                    False,
+                    "C2 real continuation closest to the frozen optimistic waiting-time and central adverse-risk target.",
+                ),
+                (
+                    "normal",
+                    "10080m",
+                    "p50",
+                    "p50",
+                    0.55,
+                    0.35,
+                    False,
+                    "C2 real continuation closest to the frozen central waiting-time and adverse-risk target.",
+                ),
+                (
+                    "adverse",
+                    "1440m",
+                    "p50",
+                    "p80",
+                    0.10,
+                    0.80,
+                    True,
+                    "A real C2 continuation that reaches the frozen 1-day p80 adverse level before eventually filling; this is the liquidation-risk path the central route can hide.",
+                ),
+                (
+                    "extreme",
+                    "43200m",
+                    "p90",
+                    "p90",
+                    0.55,
+                    0.35,
+                    False,
+                    "C2 real continuation closest to the frozen tail waiting-time and adverse-risk target; it is a stress reference, not a worst-case guarantee.",
+                ),
+            )
+            selected_scenarios: list[dict[str, Any]] = []
+            used_episodes: set[str] = set()
+            selection_details: dict[str, Any] = {}
+            normal_distribution: dict[str, Any] | None = None
+
+            for (
+                name,
+                slug,
+                wait_quantile,
+                risk_quantile,
+                duration_weight,
+                adverse_weight,
+                require_adverse_first,
+                description,
+            ) in route_specs:
+                wait_target = float(
+                    risk["remaining_time_minutes_if_filled_within_horizon"][slug][
+                        wait_quantile
+                    ]
+                )
+                adverse_target = float(
+                    risk["additional_adverse_pct"][slug][risk_quantile]
+                )
+                raw_candidates = candidates_by_horizon.get(slug, [])
+                options: list[dict[str, Any]] = []
+                for candidate in raw_candidates:
+                    episode_id = str(candidate["episode_id"])
+                    if episode_id in used_episodes:
+                        continue
+                    event = event_by_id.get(episode_id)
+                    span = path_spans.get(episode_id)
+                    if event is None or span is None:
+                        continue
+                    if int(event.fill_close_time_ms) > snapshot_close_time_ms:
+                        continue
+                    requested_remaining_bars = int(
+                        round(float(candidate["wait_minutes"]) / 5.0)
+                    )
+                    source = path_states.iloc[span[0] : span[1]]
+                    aligned = source.loc[
+                        source["remaining_to_fill_bars"].eq(requested_remaining_bars)
+                    ]
+                    if len(aligned) != 1:
+                        continue
+                    row = aligned.iloc[0]
+                    historical_move = float(row["alignment_current_move_pct"])
+                    if historical_move <= 0.0:
+                        continue
+                    remaining_bars = int(row["remaining_to_fill_bars"])
+                    historical_future = max(0.0, float(row["future_peak_move_pct"]))
+                    projected_future = max(
+                        0.0,
+                        historical_future * current_move_pct / historical_move,
+                    )
+                    entry_denominator = 100.0 + direction_sign * current_move_pct
+                    if entry_denominator <= 0.0:
+                        continue
+                    projected_additional = (
+                        max(0.0, projected_future - current_move_pct)
+                        * 100.0
+                        / entry_denominator
+                    )
+                    options.append(
+                        {
+                            "candidate": candidate,
+                            "row": row,
+                            "remaining_bars": remaining_bars,
+                            "remaining_minutes": remaining_bars * 5.0,
+                            "historical_move": historical_move,
+                            "historical_future": historical_future,
+                            "projected_future": projected_future,
+                            "projected_additional": projected_additional,
+                        }
+                    )
+                if len(options) < 3:
+                    raise ValueError(
+                        f"C2 {name} route has fewer than three drawable completed analogues"
+                    )
+
+                duration_values = np.log1p(
+                    np.asarray([item["remaining_minutes"] for item in options], dtype=float)
+                )
+                adverse_values = np.asarray(
+                    [item["projected_additional"] for item in options], dtype=float
+                )
+                distances = np.asarray(
+                    [float(item["candidate"]["distance"]) for item in options],
+                    dtype=float,
+                )
+                duration_error = np.abs(duration_values - np.log1p(wait_target))
+                adverse_error = np.abs(adverse_values - adverse_target) / max(
+                    adverse_target, 1.0
+                )
+                distance_penalty = distances / max(float(np.median(distances)), 1e-9)
+                scores = (
+                    duration_weight * duration_error
+                    + adverse_weight * adverse_error
+                    + 0.10 * distance_penalty
+                )
+                if require_adverse_first:
+                    normalized_ohlc = (
+                        "normalized_open_pct",
+                        "normalized_high_pct",
+                        "normalized_low_pct",
+                        "normalized_close_pct",
+                    )
+                    definite_crossings = np.zeros(len(options), dtype=bool)
+                    for option_index, option in enumerate(options):
+                        episode_id = str(option["candidate"]["episode_id"])
+                        span = path_spans[episode_id]
+                        source = path_states.iloc[span[0] : span[1]]
+                        future = source.loc[
+                            source["offset_bars"].gt(
+                                int(option["row"]["offset_bars"])
+                            )
+                        ]
+                        normalized_envelope = future.loc[
+                            :, list(normalized_ohlc)
+                        ].max(axis=1).to_numpy(dtype=float)
+                        projected_future_moves = (
+                            normalized_envelope
+                            * current_move_pct
+                            / option["historical_move"]
+                        )
+                        projected_additional = np.maximum(
+                            0.0,
+                            projected_future_moves - current_move_pct,
+                        )
+                        projected_additional = (
+                            projected_additional
+                            * 100.0
+                            / (100.0 + direction_sign * current_move_pct)
+                        )
+                        crossings = np.flatnonzero(
+                            projected_additional >= adverse_target - 1e-9
+                        )
+                        first_crossing = (
+                            int(crossings[0]) + 1 if len(crossings) else None
+                        )
+                        option["adverse_threshold_bars"] = first_crossing
+                        option["adverse_threshold_before_fill"] = bool(
+                            first_crossing is not None
+                            and first_crossing < option["remaining_bars"]
+                        )
+                        definite_crossings[option_index] = option[
+                            "adverse_threshold_before_fill"
+                        ]
+                    if not bool(np.any(definite_crossings)):
+                        raise ValueError(
+                            "C2 adverse-first route has no historical candidate reaching the 1-day p80 adverse level before its fill candle"
+                        )
+                    scores = scores + np.where(definite_crossings, 0.0, 100.0)
+                chosen_index = int(np.argmin(scores))
+                chosen = options[chosen_index]
+                row = chosen["row"]
+                candidate = chosen["candidate"]
+                episode_id = str(candidate["episode_id"])
+                used_episodes.add(episode_id)
+
+                duration_ranks = (
+                    pd.Series(duration_values).rank(pct=True, method="average").to_numpy()
+                )
+                adverse_ranks = (
+                    pd.Series(adverse_values).rank(pct=True, method="average").to_numpy()
+                )
+                joint_scores = 0.55 * duration_ranks + 0.45 * adverse_ranks
+                selected_joint = float(joint_scores[chosen_index])
+                selected_percentile = float(np.mean(joint_scores <= selected_joint))
+                scenario: dict[str, Any] = {
+                    "name": name,
+                    "description": description,
+                    "selector": "c2_e0_a_numerical_aligned_real_path",
+                    "episode_id": episode_id,
+                    "historical_asset": str(row["asset"]),
+                    "historical_timeframe": str(row["timeframe"]),
+                    "historical_direction": str(row["direction"]),
+                    "alignment_offset_bars": int(row["offset_bars"]),
+                    "remaining_to_fill_bars": int(chosen["remaining_bars"]),
+                    "historical_alignment_current_move_pct": float(
+                        chosen["historical_move"]
+                    ),
+                    "historical_alignment_peak_move_pct": float(
+                        row["alignment_peak_move_pct"]
+                    ),
+                    "historical_alignment_drawdown_pct": float(
+                        row["alignment_drawdown_pct"]
+                    ),
+                    "historical_future_max_away_move_pct": float(
+                        chosen["historical_future"]
+                    ),
+                    "projected_future_max_away_move_pct": float(
+                        chosen["projected_future"]
+                    ),
+                    "projected_additional_adverse_move_pct": float(
+                        chosen["projected_additional"]
+                    ),
+                    "joint_risk_score": selected_joint,
+                    "joint_risk_score_percentile": selected_percentile,
+                    "matched_cohort_size": len(options),
+                    "matched_cohort_tail_at_or_above_fraction": float(
+                        np.mean(joint_scores >= selected_joint)
+                    ),
+                    "match_score": float(candidate["distance"]),
+                    "match_score_components": {
+                        "c2_distance": float(candidate["distance"]),
+                        "numerical_target_score": float(scores[chosen_index]),
+                    },
+                    "numerical_target": {
+                        "horizon": slug,
+                        "wait_quantile": wait_quantile,
+                        "wait_minutes": wait_target,
+                        "adverse_quantile": risk_quantile,
+                        "additional_adverse_pct": adverse_target,
+                    },
+                    "c2_neighbor_rank": int(candidate["neighbor_rank"]),
+                }
+                candles, scale = projected_candles(
+                    path_states,
+                    scenario,
+                    target,
+                    direction_sign,
+                    current_move_pct,
+                    snapshot_close_time_ms,
+                    int(signal["interval_minutes"]),
+                    path_spans,
+                )
+                scenario["normalization_scale"] = round(float(scale), 8)
+                scenario["projected_candles"] = candles
+                scenario.update(
+                    projected_path_metrics(
+                        candles,
+                        target,
+                        direction_sign,
+                        current_move_pct,
+                    )
+                )
+                scenario["projected_terminal_fill_candle_utc"] = utc_iso(
+                    candles[-1]["time"] * 1000
+                    + int(signal["interval_minutes"]) * 60_000
+                )
+                if require_adverse_first:
+                    entry_price = target * (
+                        1.0 + direction_sign * current_move_pct / 100.0
+                    )
+                    adverse_threshold_price = entry_price * (
+                        1.0 + direction_sign * adverse_target / 100.0
+                    )
+                    if direction_sign == 1:
+                        threshold_hits = [
+                            index
+                            for index, candle in enumerate(candles)
+                            if float(candle["high"]) >= adverse_threshold_price
+                        ]
+                    else:
+                        threshold_hits = [
+                            index
+                            for index, candle in enumerate(candles)
+                            if float(candle["low"]) <= adverse_threshold_price
+                        ]
+                    hit_index = threshold_hits[0] if threshold_hits else None
+                    scenario["adverse_first_threshold_pct"] = adverse_target
+                    scenario["projected_adverse_threshold_price"] = round(
+                        float(adverse_threshold_price), 8
+                    )
+                    scenario["projected_adverse_threshold_bars"] = (
+                        hit_index + 1 if hit_index is not None else None
+                    )
+                    scenario["projected_adverse_threshold_candle_utc"] = (
+                        utc_iso(
+                            candles[hit_index]["time"] * 1000
+                            + int(signal["interval_minutes"]) * 60_000
+                        )
+                        if hit_index is not None
+                        else None
+                    )
+                    scenario["projected_adverse_ordering"] = (
+                        "adverse_before_fill"
+                        if hit_index is not None and hit_index < len(candles) - 1
+                        else (
+                            "same_terminal_candle_ambiguous"
+                            if hit_index is not None
+                            else "p80_threshold_not_reached"
+                        )
+                    )
+                selected_scenarios.append(scenario)
+                selection_details[name] = {
+                    "horizon": slug,
+                    "candidate_count": len(options),
+                    "selected_episode_id": episode_id,
+                    "selected_neighbor_rank": int(candidate["neighbor_rank"]),
+                    "target_wait_minutes": wait_target,
+                    "selected_wait_minutes": float(chosen["remaining_minutes"]),
+                    "target_additional_adverse_pct": adverse_target,
+                    "selected_additional_adverse_pct": float(
+                        scenario["projected_additional_adverse_move_pct"]
+                    ),
+                    "projected_adverse_threshold_bars": scenario.get(
+                        "projected_adverse_threshold_bars"
+                    ),
+                    "projected_adverse_ordering": scenario.get(
+                        "projected_adverse_ordering"
+                    ),
+                }
+                if name == "normal":
+                    normal_distribution = {
+                        "remaining_time_to_fill_minutes": {
+                            "p25": float(np.quantile(np.expm1(duration_values), 0.25)),
+                            "p50": float(np.quantile(np.expm1(duration_values), 0.50)),
+                            "p90": float(np.quantile(np.expm1(duration_values), 0.90)),
+                        },
+                        "projected_future_max_away_move_pct": {
+                            "p50": float(
+                                np.quantile(
+                                    [item["projected_future"] for item in options], 0.50
+                                )
+                            ),
+                            "p90": float(
+                                np.quantile(
+                                    [item["projected_future"] for item in options], 0.90
+                                )
+                            ),
+                        },
+                    }
+
+            projection["scenarios"] = selected_scenarios
+            if normal_distribution is not None:
+                projection["cohort_distribution"] = normal_distribution
+            projection["library"]["top_k_state_matched_episodes"] = int(
+                selection_details["normal"]["candidate_count"]
+            )
+            return {
+                "available": True,
+                "active": True,
+                "method": "C2 dynamic retrieval aligned to frozen E0/A numerical targets",
+                "architecture_version": artifact.get("architecture_version"),
+                "artifact_sha256": artifact.get("artifact_sha256"),
+                "normal_candidate_count": selection_details["normal"][
+                    "candidate_count"
+                ],
+                "selections": selection_details,
+                "legacy_v3_active": False,
+            }
+        except (KeyError, TypeError, ValueError, RuntimeError) as error:
+            return {
+                "available": True,
+                "active": False,
+                "reason": f"Numerically aligned C2 routes fell back to V1: {type(error).__name__}: {error}",
+            }
+
     def _prospective_bundle(
         self, timeframe: str
     ) -> tuple[dict[str, Any] | None, str | None]:
@@ -1610,6 +2042,9 @@ class Engine:
                 for threshold in DISPLAY_THRESHOLDS_PCT
             },
             "historical_support": prediction.get("historical_support", {}),
+            "_historical_route_candidates": prediction.get(
+                "historical_route_candidates", {}
+            ),
             "ownership": prediction.get(
                 "ownership",
                 {
@@ -2035,6 +2470,9 @@ class Engine:
         snapshot_close_time_ms = (
             int(frame["open_time"].iat[as_of_index]) + interval_minutes * 60_000
         )
+        scenario_matching_mode = (
+            "adaptive" if matching_mode == "legacy_v3" else matching_mode
+        )
         projection = project_at(
             episodes,
             path_states,
@@ -2049,7 +2487,7 @@ class Engine:
             path_states=path_states,
             native_state_index=native_state_index,
             episode_row_spans=path_spans,
-            matching_mode=matching_mode,
+            matching_mode=scenario_matching_mode,
             archetype_pool_size=ARCHETYPE_POOL_SIZE,
             archetype_blend_weight=ARCHETYPE_BLEND_WEIGHT,
         )
@@ -2059,13 +2497,7 @@ class Engine:
                 "Fewer than 12 comparable historical states; scenario selection would be too unstable"
             )
 
-        if matching_mode in {"blended", "archetype"}:
-            v3_route = {
-                "available": True,
-                "active": False,
-                "reason": "V3 is disabled in candle-shape experiments so all three routes come from the selected V1 matching cohort.",
-            }
-        else:
+        if matching_mode == "legacy_v3":
             v3_route = self._apply_v3_normal_route(
                 asset,
                 timeframe,
@@ -2081,6 +2513,18 @@ class Engine:
                 path_spans,
                 projection,
             )
+        elif matching_mode in {"blended", "archetype"}:
+            v3_route = {
+                "available": True,
+                "active": False,
+                "reason": "V3 is disabled in candle-shape experiments so all three routes come from the selected V1 matching cohort.",
+            }
+        else:
+            v3_route = {
+                "available": True,
+                "active": False,
+                "reason": "Legacy V3 is disabled in Adaptive mode; 5m routes are selected after the frozen E0/A/C2 numerical forecast is available.",
+            }
 
         eligible = projection["eligible_events"]
         trajectory_eligible = projection["trajectory_events"]
@@ -2134,6 +2578,7 @@ class Engine:
                 "candidate_availability": "An analogue is eligible only when its terminal fill candle closed at or before the pinned observation snapshot closed.",
                 "departure": "The pinned signal and analogue alignment must have a close at or beyond the opposite signal extreme; analogue alignment offsets before that departure are excluded.",
                 "future_excursion_window": "Future move-away is the direction-normalized high/low candle envelope after the snapshot through and including the terminal fill candle.",
+                "additional_adverse_denominator": "Additional adverse percentages are measured from the observable snapshot close, matching the numerical risk model; peak move-away remains measured from the wick target.",
                 "intrabar_note": "OHLC cannot establish whether a terminal fill-candle extreme happened before or after the wick touch; this is a consistent candle-envelope measurement.",
             },
             "matching": {
@@ -2149,7 +2594,11 @@ class Engine:
                     else (
                         "Soft archetype blend"
                         if matching_mode == "blended"
-                        else "Adaptive live path"
+                        else (
+                            "Legacy V3 comparison"
+                            if matching_mode == "legacy_v3"
+                            else "Adaptive live path"
+                        )
                     )
                 ),
                 "direction_policy": (
@@ -2346,9 +2795,24 @@ class Engine:
             (time.perf_counter() - v1_built) * 1000, 3
         )
         prospective_started = time.perf_counter()
-        payload["prospective_risk"] = self._prospective_risk(
-            asset, timeframe, signal_time_ms
-        )
+        prospective_risk = self._prospective_risk(asset, timeframe, signal_time_ms)
+        route_candidates = prospective_risk.pop("_historical_route_candidates", {})
+        payload["prospective_risk"] = prospective_risk
+        if matching_mode == "adaptive":
+            payload["route_engine"] = self._apply_c2_numerical_routes(
+                asset,
+                timeframe,
+                signal_time_ms,
+                payload,
+                prospective_risk,
+                route_candidates,
+            )
+        else:
+            payload["route_engine"] = {
+                "available": True,
+                "active": False,
+                "reason": "The frozen C2 + E0/A route engine is used only by Adaptive mode.",
+            }
         payload["performance"]["prospective_risk_ms"] = round(
             (time.perf_counter() - prospective_started) * 1000, 3
         )

@@ -168,13 +168,14 @@ def main() -> None:
             raise AssertionError(
                 f"Projection did not use the current {args.projection_asset} source generation"
             )
-        if [item.get("name") for item in projection.get("scenarios", [])] != [
-            "fast",
-            "normal",
-            "extreme",
-        ]:
+        expected_routes = (
+            ["fast", "normal", "adverse", "extreme"]
+            if projection.get("route_engine", {}).get("active")
+            else ["fast", "normal", "extreme"]
+        )
+        if [item.get("name") for item in projection.get("scenarios", [])] != expected_routes:
             raise AssertionError(
-                "Projection did not return the expected three route categories"
+                "Projection did not return the expected route categories"
             )
         if projection.get("schema_version") != "1.1.0":
             raise AssertionError("Projection did not return the corrected V1 schema")

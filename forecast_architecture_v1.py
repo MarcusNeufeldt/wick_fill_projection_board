@@ -3,7 +3,8 @@
 The numerical forecast and historical-support diagnostic deliberately remain
 separate.  E0 combines the A/B supervised predictions for fill and central
 adverse risk.  A continues to own waiting-time ranges and adverse tail ranges.
-C2 supplies historical support only; it is not interpreted as confidence.
+C2 supplies historical support plus eligible historical route candidates;
+support is not interpreted as confidence and does not change E0/A predictions.
 """
 
 from __future__ import annotations
@@ -111,7 +112,7 @@ def _support_for_horizon(
     features: pd.DataFrame,
     sequences: pd.DataFrame,
     asset: str,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     query_parts: list[np.ndarray] = []
     for block in artifact["block_order"]:
         block_spec = artifact["blocks"][block]
@@ -172,7 +173,29 @@ def _support_for_horizon(
     same_asset_share = float(
         np.sum(weights * (history_assets == str(asset)).astype(float)) / total_weight
     )
-    return {
+    route_candidates: list[dict[str, Any]] = []
+    all_signal_ids = np.asarray(artifact["history_signal_ids"], dtype=str)
+    all_assets = np.asarray(artifact["history_assets"], dtype=str)
+    all_adverse = np.asarray(artifact["history_adverse_pct"], dtype=float)
+    all_wait = np.asarray(artifact["history_wait_minutes"], dtype=float)
+    for rank, (position, distance) in enumerate(
+        zip(pool_positions[0], pool_distances[0], strict=True), start=1
+    ):
+        wait_minutes = float(all_wait[int(position)])
+        adverse_pct = float(all_adverse[int(position)])
+        if not np.isfinite(wait_minutes) or wait_minutes <= 0.0:
+            continue
+        route_candidates.append(
+            {
+                "episode_id": str(all_signal_ids[int(position)]),
+                "asset": str(all_assets[int(position)]),
+                "distance": float(distance),
+                "neighbor_rank": rank,
+                "wait_minutes": wait_minutes,
+                "adverse_pct": adverse_pct if np.isfinite(adverse_pct) else None,
+            }
+        )
+    result = {
         "level": SUPPORT_LABELS[bucket_index],
         "low_support": bool(
             float(support["effective_neighbors"]) < 8.0
@@ -197,6 +220,7 @@ def _support_for_horizon(
         ),
         "method": "C2 dynamic weighted historical retrieval",
     }
+    return result, route_candidates
 
 
 def predict_architecture(
@@ -221,6 +245,7 @@ def predict_architecture(
         for slug, values in a_prediction["additional_adverse_pct"].items()
     }
     support: dict[str, Any] = {}
+    route_candidates: dict[str, list[dict[str, Any]]] = {}
     running_fill = 0.0
     running_adverse = 0.0
     for horizon in bundle["horizons_minutes"]:
@@ -239,10 +264,12 @@ def predict_architecture(
         adverse[slug]["p50"] = running_adverse
         adverse[slug]["p80"] = max(float(adverse[slug]["p80"]), running_adverse)
         adverse[slug]["p90"] = max(float(adverse[slug]["p90"]), running_adverse)
-        support[slug] = _support_for_horizon(
+        support[slug], route_candidates[slug] = _support_for_horizon(
             bundle["support_artifacts"][slug], features, sequences, asset
         )
 
+    ownership = dict(bundle["ownership"])
+    ownership["routes"] = "C2 real continuations aligned to frozen E0/A targets"
     return {
         "fill_probability": fill,
         "additional_adverse_pct": adverse,
@@ -251,7 +278,8 @@ def predict_architecture(
         ],
         "competing_outcomes": a_prediction["competing_outcomes"],
         "historical_support": support,
-        "ownership": dict(bundle["ownership"]),
+        "historical_route_candidates": route_candidates,
+        "ownership": ownership,
     }
 
 

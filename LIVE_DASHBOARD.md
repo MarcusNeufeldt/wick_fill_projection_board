@@ -20,26 +20,29 @@ cd F:\explore\candle_projection_algo
 
 1. Select `ETHUSDT`, `BTCUSDT`, `SOLUSDT`, `UNIUSDT`, or `NEARUSDT`, then `1m`, `5m`, or `15m`. Each asset has an isolated `1m` V1 experiment.
 2. Pick a recent unfilled strict wick from the selector, or paste a UTC ISO timestamp.
-3. Choose `Adaptive live path`, the opt-in `Soft archetype blend`, or `Hard candle archetype`.
+3. Choose `Adaptive live path`, `Legacy V3 comparison`, the opt-in `Soft archetype blend`, or `Hard candle archetype`.
 4. Click **Project paths**.
 
 The server rejects a timestamp unless it is a strict wick signal, remains unfilled as of the local data snapshot, and is on the away-from-wick side needed for a conditional path projection.
 
-The browser receives three paths:
+Adaptive 5m returns four paths; other matchers retain their existing three-route contract:
 
-- **Fast** — a real comparable episode near the lower joint duration/projected-excursion score percentile.
-- **Normal** — a real V3 learned continuation inside a validated 1m/5m age regime; otherwise the V1 cohort centre.
-- **Extreme** — a real comparable episode near the upper joint duration/projected-excursion score percentile.
+- **Fast** — on 5m Adaptive, a real C2 episode aligned to 1-day waiting-time p10 and adverse p50.
+- **Normal** — on 5m Adaptive, a real C2 episode aligned to 7-day waiting-time p50 and adverse p50.
+- **Adverse first** — a real C2 episode that crosses the 1-day p80 adverse level before its terminal fill candle.
+- **Extreme** — on 5m Adaptive, a real C2 episode aligned to 30-day waiting-time p90 and adverse p90.
 
 The candles in a displayed route are one rescaled historical OHLC episode. The actual-price window includes 96 candles before the pinned signal and every observed candle through the snapshot, so the signal candle and its move-away leg remain inspectable. The service does not splice candles, fabricate intrabar 5-minute detail from a 15-minute path, or present the result as a fill probability.
 
-The primary **Risk from current price** card uses frozen architecture `forecast_architecture_v1_5m_2026-09-27` on every 5m pair: E0 owns fill odds and adverse p50, A owns waiting time and adverse p80/p90, and C2 supplies a separate Historical Support disclosure. One-minute views retain the previous all-outcome model until the same rolling evaluation is run on 1m. If a numerical artifact is unavailable, the older clean-fill V2a card remains a 5m-only fallback. Neither numerical layer changes the historical candles drawn by Fast/Normal/Extreme.
+The primary **Risk from current price** card uses frozen architecture `forecast_architecture_v1_5m_2026-09-27` on every 5m pair: E0 owns fill odds and adverse p50, A owns waiting time and adverse p80/p90, and C2 supplies Historical Support plus eligible historical route candidates. Adaptive uses E0/A time-risk targets to select four real paths from those C2 candidates. The card displays p50/p80/p90 risk plus the 1-day target-versus-2%-adverse and 30-day target-versus-5%-adverse contests. One-minute views retain the previous all-outcome model and V1 routes until the same rolling evaluation is run on 1m. If the frozen 5m artifact or enough drawable C2 candidates are unavailable, the dashboard retains V1 routes and reports the fallback.
+
+`Adverse first` exists because Extreme answers a different question. Extreme jointly targets a very long p90 wait and p90 adverse size; it can therefore show an enormous slow stress path while missing a nearer 2–4% expansion that matters for liquidation or stop placement. Adverse first targets the 1-day p80 adverse size, requires the historical route to cross it before the fill candle, and reports when that crossing occurs. Its percentage is measured from the current entry close, not from the wick target. It remains one historical illustration rather than an 80% route probability.
 
 `Soft archetype blend` keeps every eligible path. Live distance, peak, retracement, and age remain primary; signal-feature similarity is blended from 70% adaptive robust distance and 30% direction-mirrored candle configuration, with a softened same-asset preference. `Hard candle archetype` retains only the 240 closest configurations and removes asset and direction penalties. Both experiments disable V3 so it cannot replace their Normal route with a broader learned match.
 
 Both modes are deliberately labelled experimental. The hard gate was materially worse than adaptive matching across 215 paired snapshots. A smaller soft-blend pilot improved mean path error by 1.8%, but its uncertainty range still crosses zero. See [CANDLE_ARCHETYPE_EXPERIMENT.md](CANDLE_ARCHETYPE_EXPERIMENT.md) and [SOFT_ARCHETYPE_BLEND_PILOT.md](SOFT_ARCHETYPE_BLEND_PILOT.md).
 
-V3 is a route selector, not the range card. It replaces only the Normal route after loading a validated local age expert. Fast and Extreme remain V1. The current live gates are 1–480 and 481–2,880 bars on 5m, plus 1–2,400 and 2,401–14,400 bars on 1m. Fresh experts use forecast-anchored retrieval; the mature 1m expert uses the learned sequence embedding directly. Pins outside those ranges, all 15m pins, missing artifacts, and any V3 runtime error automatically retain V1. The Observed state panel shows whether the current Normal route came from V3 or V1.
+V3 is now an explicit legacy comparison, not part of Adaptive. Selecting `Legacy V3 comparison` lets a compatible local age expert replace only Normal while Fast and Extreme remain V1. Its former live gates are 1–480 and 481–2,880 bars on 5m, plus 1–2,400 and 2,401–14,400 bars on 1m. Pins outside those ranges, all 15m pins, missing artifacts, and runtime failures retain V1. The Observed state panel shows whether the route came from C2 + E0/A, Legacy V3, or V1.
 
 ## Data and live refresh
 

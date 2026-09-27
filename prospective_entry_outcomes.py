@@ -17,6 +17,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
+import sys
 import tempfile
 from collections import Counter
 from pathlib import Path
@@ -53,6 +55,13 @@ DEFAULT_HORIZONS_MINUTES = (60, 240, 1_440, 4_320, 10_080, 20_160, 43_200)
 DEFAULT_ADVERSE_THRESHOLDS_PCT = (1.0, 2.0, 5.0, 10.0, 20.0, 40.0)
 PRE_SIGNAL_CONTEXT_MINUTES = 8 * 60
 RECENT_CONTEXT_MINUTES = 256 * 5
+DEFAULT_RUST_BINARY = Path("experiments/rust_training_throughput/target/release") / (
+    "wick-throughput-poc.exe" if os.name == "nt" else "wick-throughput-poc"
+)
+
+
+class RustKernelError(RuntimeError):
+    """The optional Rust kernel could not prove parity with the Python frame."""
 
 
 def parse_int_list(value: str) -> tuple[int, ...]:
@@ -335,6 +344,102 @@ def _observation_record(
     return record
 
 
+def _observation_record_from_kernel(
+    frame: pd.DataFrame,
+    signal: Mapping[str, Any],
+    kernel: Mapping[str, Any],
+    horizons_minutes: Iterable[int],
+    adverse_thresholds_pct: Iterable[float],
+) -> dict[str, Any]:
+    """Assemble the authoritative Python schema from a validated Rust scan row."""
+    interval_minutes = int(signal["interval_minutes"])
+    signal_index = int(signal["bar_index"])
+    entry_index = int(kernel["entry_index"])
+    departure_index = int(kernel["departure_index"])
+    age_minutes = int(kernel["entry_age_minutes"])
+    direction_sign = int(signal["direction_sign"])
+    target = float(signal["wick_target"])
+    entry_price = float(frame["close"].iat[entry_index])
+    pre_signal_bars = max(1, PRE_SIGNAL_CONTEXT_MINUTES // interval_minutes)
+    recent_bars = max(1, RECENT_CONTEXT_MINUTES // interval_minutes)
+    signal_id = (
+        f"{signal['asset']}_{signal['timeframe']}_{signal['direction']}_"
+        f"{int(signal['open_time'])}"
+    )
+    record: dict[str, Any] = {
+        "observation_id": f"{signal_id}_entry_{age_minutes}m",
+        "signal_id": signal_id,
+        "asset": str(signal["asset"]),
+        "timeframe": str(signal["timeframe"]),
+        "direction": str(signal["direction"]),
+        "direction_sign": direction_sign,
+        "signal_open_time_ms": int(signal["open_time"]),
+        "signal_index": signal_index,
+        "departure_index": departure_index,
+        "entry_index": entry_index,
+        "entry_open_time_ms": int(frame["open_time"].iat[entry_index]),
+        "entry_close_time_ms": int(frame["close_time"].iat[entry_index]),
+        "entry_open_time_utc": utc_iso(int(frame["open_time"].iat[entry_index])),
+        "entry_age_minutes": age_minutes,
+        "entry_age_bars": int(entry_index - signal_index),
+        "entry_price": entry_price,
+        "entry_price_field": "close",
+        "wick_target": target,
+        "signal_volume": float(
+            signal["signal_volume"] if "signal_volume" in signal else signal["volume"]
+        ),
+        "entry_distance_from_target_pct": float(
+            kernel["entry_distance_from_target_pct"]
+        ),
+        "peak_distance_from_target_pct": float(
+            kernel["peak_distance_from_target_pct"]
+        ),
+        "drawdown_from_peak_pct": float(kernel["drawdown_from_peak_pct"]),
+        "departure_to_entry_bars": int(entry_index - departure_index),
+        "available_future_bars": int(kernel["available_future_bars"]),
+        "target_touch_bars_from_entry": kernel["target_touch_bars_from_entry"],
+        "sequence_contract_version": SEQUENCE_CONTRACT_VERSION,
+        "pre_signal_start_index": max(0, signal_index - pre_signal_bars),
+        "pre_signal_end_index": signal_index - 1,
+        "recent_start_index": max(0, entry_index - recent_bars + 1),
+        "recent_end_index": entry_index,
+        "signal_to_entry_start_index": signal_index,
+        "signal_to_entry_end_index": entry_index,
+    }
+    for field in FEATURE_COLUMNS:
+        record[field] = float(signal[field])
+
+    thresholds = tuple(float(value) for value in adverse_thresholds_pct)
+    first_adverse = tuple(kernel["first_adverse_bars_from_entry"])
+    if len(first_adverse) != len(thresholds):
+        raise RustKernelError("Rust first-adverse width does not match thresholds")
+    for threshold, bars in zip(thresholds, first_adverse, strict=True):
+        record[f"first_adverse_{threshold_slug(threshold)}pct_bars_from_entry"] = bars
+
+    horizons = tuple(int(value) for value in horizons_minutes)
+    kernel_horizons = tuple(kernel["horizons"])
+    if len(kernel_horizons) != len(horizons):
+        raise RustKernelError("Rust horizon width does not match requested horizons")
+    for horizon_minutes, values in zip(horizons, kernel_horizons, strict=True):
+        if int(values["horizon_minutes"]) != horizon_minutes:
+            raise RustKernelError("Rust horizon order does not match requested horizons")
+        slug = horizon_slug(horizon_minutes)
+        outcomes = tuple(values["outcomes"])
+        if len(outcomes) != len(thresholds):
+            raise RustKernelError("Rust outcome width does not match thresholds")
+        record[f"horizon_{slug}_fully_observed"] = bool(values["fully_observed"])
+        record[f"target_hit_{slug}"] = bool(values["target_hit"])
+        record[f"max_adverse_pre_target_lower_{slug}_pct"] = float(
+            values["adverse_lower_pct"]
+        )
+        record[f"max_adverse_pre_target_upper_{slug}_pct"] = float(
+            values["adverse_upper_pct"]
+        )
+        for threshold, outcome in zip(thresholds, outcomes, strict=True):
+            record[f"outcome_{slug}_vs_{threshold_slug(threshold)}pct"] = str(outcome)
+    return record
+
+
 def materialize_v3_observable_inputs(
     frame: pd.DataFrame,
     observation: Mapping[str, Any],
@@ -425,7 +530,7 @@ def _materialize_v3_observable_inputs_configured(
     }
 
 
-def build_series_dataset(
+def _build_series_dataset_python(
     frame: pd.DataFrame,
     asset: str,
     timeframe: str,
@@ -514,6 +619,258 @@ def build_series_dataset(
     return signal_frame, observation_frame, summary
 
 
+def _csv_values(values: Iterable[int | float]) -> str:
+    return ",".join(f"{value:g}" if isinstance(value, float) else str(value) for value in values)
+
+
+def _run_rust_kernel(
+    source_path: Path,
+    source_rows: int,
+    timeframe: str,
+    entry_ages_minutes: tuple[int, ...],
+    horizons_minutes: tuple[int, ...],
+    adverse_thresholds_pct: tuple[float, ...],
+    maximum_followup_days: int,
+    rust_binary: Path,
+) -> dict[str, Any]:
+    binary = Path(rust_binary)
+    if not binary.is_file():
+        raise RustKernelError(f"Rust kernel binary not found: {binary}")
+    source = Path(source_path)
+    if not source.is_file():
+        raise RustKernelError(f"Rust kernel source file not found: {source}")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as handle:
+        export_path = Path(handle.name)
+    command = [
+        str(binary),
+        "--mode",
+        "export",
+        "--input",
+        str(source),
+        "--output",
+        str(export_path),
+        "--timeframe",
+        timeframe,
+        "--maximum-fill-days",
+        str(maximum_followup_days),
+        "--maximum-rows",
+        str(source_rows),
+        "--entry-ages-minutes",
+        _csv_values(entry_ages_minutes),
+        "--horizons-minutes",
+        _csv_values(horizons_minutes),
+        "--adverse-thresholds-pct",
+        _csv_values(adverse_thresholds_pct),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        try:
+            json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            raise RustKernelError("Rust kernel returned invalid summary JSON") from error
+        try:
+            with export_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError) as error:
+            raise RustKernelError("Rust kernel export could not be read") from error
+    except (OSError, subprocess.CalledProcessError) as error:
+        detail = getattr(error, "stderr", None) or str(error)
+        raise RustKernelError(f"Rust kernel execution failed: {detail.strip()}") from error
+    finally:
+        export_path.unlink(missing_ok=True)
+    if not isinstance(payload, dict):
+        raise RustKernelError("Rust kernel export is not an object")
+    return payload
+
+
+def _validate_rust_kernel(
+    payload: Mapping[str, Any],
+    signals: pd.DataFrame,
+    source_rows: int,
+    timeframe: str,
+    entry_ages_minutes: tuple[int, ...],
+    horizons_minutes: tuple[int, ...],
+    adverse_thresholds_pct: tuple[float, ...],
+) -> None:
+    interval_minutes = int(timeframe.removesuffix("m"))
+    checks = {
+        "schema version": payload.get("schema_version") == "rust-prospective-kernel-v1",
+        "timeframe": payload.get("timeframe") == timeframe,
+        "interval": int(payload.get("interval_minutes", -1)) == interval_minutes,
+        "source rows": int(payload.get("source_rows", -1)) == source_rows,
+        "entry ages": tuple(payload.get("entry_ages_minutes", ())) == entry_ages_minutes,
+        "horizons": tuple(payload.get("horizons_minutes", ())) == horizons_minutes,
+        "thresholds": tuple(float(value) for value in payload.get("adverse_thresholds_pct", ()))
+        == adverse_thresholds_pct,
+    }
+    failed = [name for name, passed in checks.items() if not passed]
+    if failed:
+        raise RustKernelError(f"Rust kernel contract mismatch: {', '.join(failed)}")
+
+    expected_indexes = [int(value) for value in signals["bar_index"].tolist()]
+    traces = payload.get("traces")
+    if not isinstance(traces, list):
+        raise RustKernelError("Rust kernel traces are missing")
+    actual_indexes = [int(row["signal_index"]) for row in traces]
+    if actual_indexes != expected_indexes:
+        raise RustKernelError("Rust/Python strict-signal order mismatch")
+    if int(payload.get("strict_signals", -1)) != len(expected_indexes):
+        raise RustKernelError("Rust/Python strict-signal count mismatch")
+    if int(payload.get("signal_index_checksum", -1)) != sum(expected_indexes):
+        raise RustKernelError("Rust/Python strict-signal checksum mismatch")
+    observations = payload.get("observations")
+    aggregate = payload.get("aggregate")
+    if not isinstance(observations, list) or not isinstance(aggregate, dict):
+        raise RustKernelError("Rust observation export is incomplete")
+    if int(aggregate.get("observation_count", -1)) != len(observations):
+        raise RustKernelError("Rust observation count mismatch")
+
+
+def _build_series_dataset_rust(
+    frame: pd.DataFrame,
+    source_path: Path,
+    asset: str,
+    timeframe: str,
+    entry_ages_minutes: Iterable[int],
+    horizons_minutes: Iterable[int],
+    adverse_thresholds_pct: Iterable[float],
+    maximum_followup_days: int,
+    rust_binary: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    interval_minutes = int(timeframe.removesuffix("m"))
+    ages = tuple(int(value) for value in entry_ages_minutes)
+    horizons = tuple(int(value) for value in horizons_minutes)
+    thresholds = tuple(float(value) for value in adverse_thresholds_pct)
+    if any(value % interval_minutes for value in (*ages, *horizons)):
+        raise ValueError("entry ages and horizons must be exact multiples of the timeframe")
+    if maximum_followup_days * 24 * 60 < max(ages) + max(horizons):
+        raise ValueError("maximum follow-up must cover the oldest entry age plus longest horizon")
+
+    signals = detect_strict_signals(frame, asset, timeframe)
+    payload = _run_rust_kernel(
+        source_path,
+        len(frame),
+        timeframe,
+        ages,
+        horizons,
+        thresholds,
+        maximum_followup_days,
+        rust_binary,
+    )
+    _validate_rust_kernel(payload, signals, len(frame), timeframe, ages, horizons, thresholds)
+
+    maximum_future_bars = maximum_followup_days * 24 * 60 // interval_minutes
+    signal_maps = [row._asdict() for row in signals.itertuples(index=False)]
+    signal_by_index = {int(signal["bar_index"]): signal for signal in signal_maps}
+    trace_by_index = {
+        int(trace["signal_index"]): trace for trace in payload["traces"]
+    }
+    statuses: Counter[str] = Counter()
+    signal_records: list[dict[str, Any]] = []
+    for signal in signal_maps:
+        signal_index = int(signal["bar_index"])
+        trace = trace_by_index[signal_index]
+        status = str(trace["status"])
+        statuses[status] += 1
+        signal_records.append(
+            _signal_record(
+                frame,
+                signal,
+                status,
+                trace["departure_index"],
+                trace["fill_index"],
+                maximum_future_bars,
+            )
+        )
+
+    observation_records: list[dict[str, Any]] = []
+    for kernel in payload["observations"]:
+        signal_index = int(kernel["signal_index"])
+        signal = signal_by_index.get(signal_index)
+        if signal is None:
+            raise RustKernelError("Rust observation references an unknown signal")
+        age_minutes = int(kernel["entry_age_minutes"])
+        if age_minutes not in ages:
+            raise RustKernelError("Rust observation references an unknown entry age")
+        if int(kernel["entry_index"]) != signal_index + age_minutes // interval_minutes:
+            raise RustKernelError("Rust observation entry index is inconsistent")
+        trace = trace_by_index[signal_index]
+        if kernel["departure_index"] != trace["departure_index"]:
+            raise RustKernelError("Rust observation departure index is inconsistent")
+        observation_records.append(
+            _observation_record_from_kernel(frame, signal, kernel, horizons, thresholds)
+        )
+
+    aggregate = payload["aggregate"]
+    signal_frame = pd.DataFrame.from_records(signal_records)
+    observation_frame = pd.DataFrame.from_records(observation_records)
+    summary = {
+        "asset": asset,
+        "timeframe": timeframe,
+        "signal_count": int(len(signal_frame)),
+        "observation_count": int(len(observation_frame)),
+        "resolution_status_counts": dict(sorted(statuses.items())),
+        "omitted_entry_counts": dict(sorted(aggregate["omitted_entry_counts"].items())),
+        "source_start_utc": utc_iso(int(frame["open_time"].iat[0])),
+        "source_end_utc": utc_iso(int(frame["open_time"].iat[-1])),
+        "label_engine": "rust",
+    }
+    return signal_frame, observation_frame, summary
+
+
+def build_series_dataset(
+    frame: pd.DataFrame,
+    asset: str,
+    timeframe: str,
+    entry_ages_minutes: Iterable[int] = DEFAULT_ENTRY_AGES_MINUTES,
+    horizons_minutes: Iterable[int] = DEFAULT_HORIZONS_MINUTES,
+    adverse_thresholds_pct: Iterable[float] = DEFAULT_ADVERSE_THRESHOLDS_PCT,
+    maximum_followup_days: int = 180,
+    *,
+    engine: str = "python",
+    source_path: Path | None = None,
+    rust_binary: Path = DEFAULT_RUST_BINARY,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Build one series with Python or the parity-checked optional Rust kernel."""
+    if engine not in {"python", "rust", "auto"}:
+        raise ValueError("engine must be python, rust, or auto")
+    if engine != "python" and source_path is not None:
+        try:
+            return _build_series_dataset_rust(
+                frame,
+                source_path,
+                asset,
+                timeframe,
+                entry_ages_minutes,
+                horizons_minutes,
+                adverse_thresholds_pct,
+                maximum_followup_days,
+                rust_binary,
+            )
+        except RustKernelError as error:
+            if engine == "rust":
+                raise
+            print(f"Rust label kernel unavailable; using Python: {error}", file=sys.stderr)
+    elif engine == "rust":
+        raise RustKernelError("explicit Rust engine requires source_path")
+    signals, observations, summary = _build_series_dataset_python(
+        frame,
+        asset,
+        timeframe,
+        entry_ages_minutes,
+        horizons_minutes,
+        adverse_thresholds_pct,
+        maximum_followup_days,
+    )
+    summary["label_engine"] = "python"
+    return signals, observations, summary
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
@@ -540,6 +897,13 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_ADVERSE_THRESHOLDS_PCT,
     )
     parser.add_argument("--maximum-followup-days", type=int, default=180)
+    parser.add_argument(
+        "--engine",
+        choices=("auto", "python", "rust"),
+        default="auto",
+        help="label scan engine; auto validates Rust parity and falls back to Python",
+    )
+    parser.add_argument("--rust-binary", type=Path, default=DEFAULT_RUST_BINARY)
     return parser.parse_args()
 
 
@@ -568,6 +932,9 @@ def main() -> None:
                 args.horizons_minutes,
                 args.adverse_thresholds_pct,
                 args.maximum_followup_days,
+                engine=args.engine,
+                source_path=source,
+                rust_binary=args.rust_binary,
             )
             stem = f"{asset}_{timeframe}"
             signal_path = args.output_dir / "signals" / f"{stem}.parquet"
@@ -591,6 +958,8 @@ def main() -> None:
         "horizons_minutes": list(args.horizons_minutes),
         "adverse_thresholds_pct": list(args.adverse_thresholds_pct),
         "maximum_followup_days": int(args.maximum_followup_days),
+        "requested_label_engine": args.engine,
+        "rust_binary": str(args.rust_binary),
         "status_semantics": "unfilled means not touched within the explicit follow-up horizon, not never; right_censored means the source ended before that horizon",
         "intrabar_policy": "same-bar target/adverse events are ambiguous; adverse lower bound excludes and upper bound includes the target-touch bar",
         "sequence_contract": {

@@ -354,7 +354,7 @@ def train(
             "adverse_p80_p90": "A calibrated tail",
             "waiting_time": "A supervised model",
             "historical_support": "C2 dynamic weighted retrieval",
-            "routes": "separate historical illustration layer",
+            "routes": "C2 real continuations aligned to frozen E0/A targets",
         },
         "training_rows": int(len(deployment)),
         "training_episodes": int(deployment["signal_id"].nunique()),

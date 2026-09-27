@@ -33,7 +33,10 @@ from build_conditional_path_scenarios import (
     select_scenarios,
 )
 from prospective_entry_outcomes import (
+    RustKernelError,
     _observation_record,
+    _observation_record_from_kernel,
+    build_series_dataset,
     competing_outcome,
     materialize_v3_observable_inputs,
 )
@@ -260,12 +263,17 @@ class ProjectionSemanticsTests(unittest.TestCase):
 
     def test_dashboard_exposes_validated_archetype_matching_mode(self) -> None:
         self.assertEqual(validate_matching_mode("adaptive"), "adaptive")
+        self.assertEqual(validate_matching_mode("legacy_v3"), "legacy_v3")
         self.assertEqual(validate_matching_mode("blended"), "blended")
         self.assertEqual(validate_matching_mode("archetype"), "archetype")
         with self.assertRaisesRegex(ValueError, "matching_mode"):
             validate_matching_mode("unknown")
         self.assertIn('id="matchingMode"', HTML)
+        self.assertIn("Legacy V3 comparison", HTML)
         self.assertIn("Soft archetype blend", HTML)
+        self.assertIn("Adverse first", HTML)
+        self.assertIn("p50 / p80 / p90", HTML)
+        self.assertIn("cohort slower/riskier", HTML)
 
     def test_incremental_signal_detection_resumes_from_the_cached_generation(self) -> None:
         frame = pd.DataFrame({"open_time": np.arange(200, dtype=np.int64) * 60_000})
@@ -368,7 +376,22 @@ class ProjectionSemanticsTests(unittest.TestCase):
         self.assertAlmostEqual(scale, 3.0)
         metrics = projected_path_metrics(candles, 100.0, 1, 6.0)
         self.assertAlmostEqual(metrics["projected_future_max_away_move_pct"], 21.0, places=5)
-        self.assertAlmostEqual(metrics["projected_additional_adverse_move_pct"], 15.0, places=5)
+        self.assertAlmostEqual(
+            metrics["projected_additional_adverse_move_pct"],
+            15.0 / 106.0 * 100.0,
+            places=5,
+        )
+        upper_metrics = projected_path_metrics(
+            [{"time": 1, "open": 94.0, "high": 94.0, "low": 79.0, "close": 80.0}],
+            100.0,
+            -1,
+            6.0,
+        )
+        self.assertAlmostEqual(
+            upper_metrics["projected_additional_adverse_move_pct"],
+            15.0 / 94.0 * 100.0,
+            places=5,
+        )
 
     def test_projected_coordinates_reverse_the_historical_risk_order(self) -> None:
         rows: list[dict[str, object]] = []
@@ -859,6 +882,81 @@ class ProjectionSemanticsTests(unittest.TestCase):
         self.assertEqual(row["outcome_3m_vs_1pct"], "ambiguous_intrabar")
         self.assertAlmostEqual(row["max_adverse_pre_target_lower_3m_pct"], 111 / 110 * 100 - 100)
         self.assertAlmostEqual(row["max_adverse_pre_target_upper_3m_pct"], 112 / 110 * 100 - 100)
+
+        kernel = {
+            "signal_index": 0,
+            "entry_age_minutes": 2,
+            "entry_index": 2,
+            "departure_index": 1,
+            "available_future_bars": 3,
+            "target_touch_bars_from_entry": 2,
+            "entry_distance_from_target_pct": row["entry_distance_from_target_pct"],
+            "peak_distance_from_target_pct": row["peak_distance_from_target_pct"],
+            "drawdown_from_peak_pct": row["drawdown_from_peak_pct"],
+            "first_adverse_bars_from_entry": [2],
+            "horizons": [
+                {
+                    "horizon_minutes": 3,
+                    "fully_observed": True,
+                    "target_hit": True,
+                    "adverse_lower_pct": row["max_adverse_pre_target_lower_3m_pct"],
+                    "adverse_upper_pct": row["max_adverse_pre_target_upper_3m_pct"],
+                    "outcomes": ["ambiguous_intrabar"],
+                }
+            ],
+        }
+        rust_row = _observation_record_from_kernel(
+            frame,
+            signal,
+            kernel,
+            horizons_minutes=(3,),
+            adverse_thresholds_pct=(1.0,),
+        )
+        self.assertEqual(rust_row, row)
+
+    def test_auto_outcome_engine_falls_back_to_python(self) -> None:
+        count = 70
+        times = np.arange(count, dtype=np.int64) * 60_000
+        frame = pd.DataFrame(
+            {
+                "open_time": times,
+                "close_time": times + 59_999,
+                "open": np.full(count, 100.0),
+                "high": np.full(count, 100.2),
+                "low": np.full(count, 99.8),
+                "close": np.full(count, 100.0),
+                "volume": np.ones(count),
+            }
+        )
+        with patch(
+            "prospective_entry_outcomes._build_series_dataset_rust",
+            side_effect=RustKernelError("intentional test mismatch"),
+        ) as rust_builder:
+            _, _, summary = build_series_dataset(
+                frame,
+                "ETHUSDT",
+                "1m",
+                entry_ages_minutes=(1,),
+                horizons_minutes=(1,),
+                adverse_thresholds_pct=(1.0,),
+                maximum_followup_days=1,
+                engine="auto",
+                source_path=Path("unused.csv"),
+            )
+            with self.assertRaises(RustKernelError):
+                build_series_dataset(
+                    frame,
+                    "ETHUSDT",
+                    "1m",
+                    entry_ages_minutes=(1,),
+                    horizons_minutes=(1,),
+                    adverse_thresholds_pct=(1.0,),
+                    maximum_followup_days=1,
+                    engine="rust",
+                    source_path=Path("unused.csv"),
+                )
+        self.assertEqual(summary["label_engine"], "python")
+        self.assertEqual(rust_builder.call_count, 2)
 
     def test_competing_outcome_preserves_censoring(self) -> None:
         self.assertEqual(competing_outcome(3, 3, 10, 10), "ambiguous_intrabar")

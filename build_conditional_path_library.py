@@ -16,6 +16,7 @@ import gzip
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 from collections import Counter
 from pathlib import Path
@@ -429,6 +430,133 @@ def process_series(
     return events, dict(statuses), path_rows_written
 
 
+def process_series_rust(
+    frame: pd.DataFrame,
+    source_path: Path,
+    asset: str,
+    timeframe: str,
+    maximum_fill_days: int,
+    paths_dir: Path,
+    rust_binary: Path,
+    *,
+    path_format: str,
+    path_columns: Iterable[str],
+) -> tuple[list[dict[str, Any]], dict[str, int], int]:
+    """Use the parity-checked Rust tracer/path writer and retain Python event schema."""
+    if timeframe not in {"1m", "5m"}:
+        raise ValueError("Rust route bridge supports raw 1m and 5m series")
+    binary = Path(rust_binary)
+    if not binary.is_file():
+        raise RuntimeError(f"Rust route kernel binary not found: {binary}")
+    source = Path(source_path)
+    if not source.is_file():
+        raise RuntimeError(f"Rust route source file not found: {source}")
+    signals = detect_strict_signals(frame, asset, timeframe)
+    expected_indexes = [int(value) for value in signals["bar_index"].tolist()]
+    path_file = f"{asset}_{timeframe}_paths.csv.gz"
+    destination = paths_dir / path_file
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as handle:
+        metadata_path = Path(handle.name)
+    with tempfile.NamedTemporaryFile(
+        delete=False, dir=destination.parent, suffix=".csv.gz.tmp"
+    ) as handle:
+        temporary_path = Path(handle.name)
+    command = [
+        str(binary),
+        "--mode",
+        "routes",
+        "--input",
+        str(source),
+        "--output",
+        str(metadata_path),
+        "--path-output",
+        str(temporary_path),
+        "--path-format",
+        path_format,
+        "--asset",
+        asset,
+        "--timeframe",
+        timeframe,
+        "--maximum-fill-days",
+        str(maximum_fill_days),
+        "--minimum-open-time-ms",
+        str(int(frame["open_time"].iat[0])),
+        "--maximum-open-time-exclusive-ms",
+        str(
+            int(frame["open_time"].iat[-1])
+            + int(timeframe.removesuffix("m")) * 60_000
+        ),
+    ]
+    try:
+        completed = subprocess.run(command, check=True, capture_output=True, text=True)
+        json.loads(completed.stdout)
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        checks = {
+            "schema": payload.get("schema_version") == "rust-route-kernel-v1",
+            "asset": payload.get("asset") == asset,
+            "timeframe": payload.get("timeframe") == timeframe,
+            "source rows": int(payload.get("source_rows", -1)) == len(frame),
+            "source start": int(payload.get("source_start_open_time_ms", -1))
+            == int(frame["open_time"].iat[0]),
+            "source end": int(payload.get("source_end_open_time_ms", -1))
+            == int(frame["open_time"].iat[-1]),
+            "path format": payload.get("path_format") == path_format,
+        }
+        failed = [name for name, passed in checks.items() if not passed]
+        if failed:
+            raise RuntimeError(f"Rust route contract mismatch: {', '.join(failed)}")
+        traces = payload.get("traces")
+        if not isinstance(traces, list):
+            raise RuntimeError("Rust route traces are missing")
+        actual_indexes = [int(row["signal_index"]) for row in traces]
+        if actual_indexes != expected_indexes:
+            raise RuntimeError("Rust/Python route signal order mismatch")
+        if int(payload.get("strict_signals", -1)) != len(expected_indexes):
+            raise RuntimeError("Rust/Python route signal count mismatch")
+        if int(payload.get("signal_index_checksum", -1)) != sum(expected_indexes):
+            raise RuntimeError("Rust/Python route signal checksum mismatch")
+
+        statuses = Counter(str(row["status"]) for row in traces)
+        if dict(sorted(statuses.items())) != payload.get("statuses"):
+            raise RuntimeError("Rust route status counts are inconsistent")
+        signal_by_index = {
+            int(signal["bar_index"]): signal
+            for signal in (row._asdict() for row in signals.itertuples(index=False))
+        }
+        events = []
+        for trace in traces:
+            if trace["status"] != "filled":
+                continue
+            signal = signal_by_index[int(trace["signal_index"])]
+            events.append(
+                episode_record(
+                    frame,
+                    signal,
+                    int(trace["departure_index"]),
+                    int(trace["fill_index"]),
+                    path_file,
+                )
+            )
+        if len(events) != int(payload.get("completed_episode_count", -1)):
+            raise RuntimeError("Rust route completed-episode count mismatch")
+        path_rows_written = int(payload.get("path_rows_written", -1))
+        if path_rows_written <= 0:
+            raise RuntimeError("Rust route writer produced no path rows")
+        with gzip.open(temporary_path, "rt", encoding="utf-8", newline="") as handle:
+            header = next(csv.reader(handle), None)
+        if header != list(path_columns):
+            raise RuntimeError("Rust route path schema mismatch")
+        os.replace(temporary_path, destination)
+        return events, dict(statuses), path_rows_written
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as error:
+        detail = getattr(error, "stderr", None) or str(error)
+        raise RuntimeError(f"Rust route kernel failed: {detail.strip()}") from error
+    finally:
+        metadata_path.unlink(missing_ok=True)
+        temporary_path.unlink(missing_ok=True)
+
+
 def main() -> None:
     root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__)
@@ -438,6 +566,17 @@ def main() -> None:
     parser.add_argument("--uni-5m", type=Path, default=root / "data" / "UNIUSDT_5m_5y.csv")
     parser.add_argument("--near-5m", type=Path, default=root / "data" / "NEARUSDT_5m_5y.csv")
     parser.add_argument("--out-dir", type=Path, default=default_library_dir(root))
+    parser.add_argument("--engine", choices=("python", "rust"), default="python")
+    parser.add_argument(
+        "--rust-binary",
+        type=Path,
+        default=root
+        / "experiments"
+        / "rust_training_throughput"
+        / "target"
+        / "release"
+        / ("wick-throughput-poc.exe" if os.name == "nt" else "wick-throughput-poc"),
+    )
     parser.add_argument(
         "--max-fill-days",
         type=int,
@@ -479,9 +618,24 @@ def main() -> None:
     for asset, source in common.items():
         for timeframe, series in (("5m", source), ("15m", resample_to_fifteen_minutes(source))):
             print(json.dumps({"stage": "begin_series", "asset": asset, "timeframe": timeframe}), flush=True)
-            events, statuses, path_rows_written = process_series(
-                series, asset, timeframe, args.max_fill_days, paths_dir
-            )
+            if args.engine == "rust" and timeframe == "5m":
+                events, statuses, path_rows_written = process_series_rust(
+                    series,
+                    source_paths[asset],
+                    asset,
+                    timeframe,
+                    args.max_fill_days,
+                    paths_dir,
+                    args.rust_binary,
+                    path_format="full",
+                    path_columns=PATH_FIELDS,
+                )
+                route_engine = "rust"
+            else:
+                events, statuses, path_rows_written = process_series(
+                    series, asset, timeframe, args.max_fill_days, paths_dir
+                )
+                route_engine = "python"
             all_events.extend(events)
             strata.append(
                 {
@@ -492,6 +646,7 @@ def main() -> None:
                     "outcomes": {key: int(value) for key, value in sorted(statuses.items())},
                     "completed_clean_paths": len(events),
                     "path_rows_written": path_rows_written,
+                    "route_engine": route_engine,
                 }
             )
     events_frame = pd.DataFrame.from_records(all_events)

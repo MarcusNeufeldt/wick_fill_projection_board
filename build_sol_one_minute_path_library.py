@@ -29,6 +29,7 @@ from build_conditional_path_library import (
     atomic_write_json,
     detect_strict_signals,
     episode_record,
+    process_series_rust,
     read_one_minute_file,
     sha256_file,
     trace_clean_path,
@@ -167,6 +168,17 @@ def main() -> None:
         help="Contiguous 1m source CSV; --sol-1m remains a compatibility alias.",
     )
     parser.add_argument("--out-dir", type=Path)
+    parser.add_argument("--engine", choices=("python", "rust"), default="python")
+    parser.add_argument(
+        "--rust-binary",
+        type=Path,
+        default=root
+        / "experiments"
+        / "rust_training_throughput"
+        / "target"
+        / "release"
+        / ("wick-throughput-poc.exe" if os.name == "nt" else "wick-throughput-poc"),
+    )
     parser.add_argument(
         "--max-fill-days",
         type=int,
@@ -188,8 +200,23 @@ def main() -> None:
     paths_dir = out_dir / "paths"
     print(json.dumps({"stage": "begin_series", "asset": asset, "timeframe": "1m"}), flush=True)
     path_file = f"{asset}_1m_paths.csv.gz"
-    events, statuses = trace_events(source, asset, args.max_fill_days, path_file)
-    path_rows_written = write_compact_paths(paths_dir / path_file, source, events, asset)
+    if args.engine == "rust":
+        events, statuses, path_rows_written = process_series_rust(
+            source,
+            source_path,
+            asset,
+            "1m",
+            args.max_fill_days,
+            paths_dir,
+            args.rust_binary,
+            path_format="compact",
+            path_columns=COMPACT_PATH_COLUMNS,
+        )
+        route_engine = "rust"
+    else:
+        events, statuses = trace_events(source, asset, args.max_fill_days, path_file)
+        path_rows_written = write_compact_paths(paths_dir / path_file, source, events, asset)
+        route_engine = "python"
     events_frame = pd.DataFrame.from_records(events)
     if events_frame.empty:
         raise RuntimeError(f"No completed clean {asset} 1m paths were found")
@@ -208,6 +235,7 @@ def main() -> None:
             "outcomes": {key: int(value) for key, value in sorted(statuses.items())},
             "completed_clean_paths": int(len(events)),
             "path_rows_written": int(path_rows_written),
+            "route_engine": route_engine,
         }
     ]
     summary = {

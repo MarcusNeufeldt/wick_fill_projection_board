@@ -37,6 +37,22 @@ OWNED_LIBRARY_ENTRIES = {
 }
 
 
+def cargo_executable() -> Path:
+    configured = os.environ.get("CARGO")
+    candidates = [Path(configured)] if configured else []
+    discovered = shutil.which("cargo")
+    if discovered:
+        candidates.append(Path(discovered))
+    if os.name == "nt":
+        program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        candidates.extend(sorted(program_files.glob("Rust stable MSVC */bin/cargo.exe"), reverse=True))
+        candidates.extend(sorted(program_files.glob("Rust stable GNU */bin/cargo.exe"), reverse=True))
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise RuntimeError("Rust cargo executable not found; set CARGO to its full path")
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -177,8 +193,7 @@ class UpdateRunner:
         self.manifest["stages"].append(entry)
         self.save()
 
-    def command(self, stage: str, script: str, *arguments: object) -> None:
-        command = [sys.executable, str(self.root / script), *(str(value) for value in arguments)]
+    def external_command(self, stage: str, command: list[str]) -> None:
         print(f"\n[{stage}]\n{subprocess.list2cmdline(command)}", flush=True)
         if self.dry_run:
             self.event(stage, "planned", command=command)
@@ -194,6 +209,30 @@ class UpdateRunner:
         elapsed = (datetime.now(timezone.utc) - started).total_seconds()
         self.event(stage, "complete", elapsed_seconds=round(elapsed, 3))
 
+    def command(self, stage: str, script: str, *arguments: object) -> None:
+        command = [sys.executable, str(self.root / script), *(str(value) for value in arguments)]
+        self.external_command(stage, command)
+
+    def build_rust_kernel(self) -> Path:
+        crate = self.root / "experiments" / "rust_training_throughput"
+        binary = crate / "target" / "release" / (
+            "wick-throughput-poc.exe" if os.name == "nt" else "wick-throughput-poc"
+        )
+        cargo = cargo_executable()
+        self.external_command(
+            "build_rust_kernel",
+            [
+                str(cargo),
+                "build",
+                "--release",
+                "--manifest-path",
+                str(crate / "Cargo.toml"),
+            ],
+        )
+        if not self.dry_run and not binary.is_file():
+            raise RuntimeError(f"Rust kernel build did not produce {binary}")
+        return binary
+
     def refresh_sources(self) -> None:
         if self.skip_refresh:
             self.event("refresh_sources", "skipped", reason="--skip-refresh")
@@ -206,7 +245,9 @@ class UpdateRunner:
                 timeframe,
             )
 
-    def rebuild_one_library(self, timeframe: str, asset: str | None = None) -> None:
+    def rebuild_one_library(
+        self, timeframe: str, rust_binary: Path, asset: str | None = None
+    ) -> None:
         if timeframe == "5m":
             destination = default_library_dir(self.root)
             stage = self.stage_root / destination.name
@@ -216,6 +257,10 @@ class UpdateRunner:
                 "build_conditional_path_library.py",
                 "--out-dir",
                 stage,
+                "--engine",
+                "rust",
+                "--rust-binary",
+                rust_binary,
             )
             if self.dry_run:
                 self.event("promote_routes_5m", "planned", destination=str(destination))
@@ -265,6 +310,10 @@ class UpdateRunner:
             asset,
             "--out-dir",
             stage,
+            "--engine",
+            "rust",
+            "--rust-binary",
+            rust_binary,
         )
         if self.dry_run:
             self.event(f"promote_routes_1m_{slug}", "planned", destination=str(destination))
@@ -304,12 +353,12 @@ class UpdateRunner:
             "--force",
         )
 
-    def rebuild_routes(self) -> None:
-        self.rebuild_one_library("5m")
+    def rebuild_routes(self, rust_binary: Path) -> None:
+        self.rebuild_one_library("5m", rust_binary)
         for asset in SUPPORTED_ASSETS:
-            self.rebuild_one_library("1m", asset)
+            self.rebuild_one_library("1m", rust_binary, asset)
 
-    def rebuild_outcomes(self) -> Path:
+    def rebuild_outcomes(self, rust_binary: Path) -> Path:
         destination = self.root / "data" / "prospective_entry_outcomes_v1"
         stage = self.stage_root / destination.name
         self.command(
@@ -323,6 +372,10 @@ class UpdateRunner:
             ",".join(SUPPORTED_ASSETS),
             "--timeframes",
             ",".join(TIMEFRAMES),
+            "--engine",
+            "rust",
+            "--rust-binary",
+            rust_binary,
         )
         if self.dry_run:
             self.event("promote_all_outcomes", "planned", destination=str(destination))
@@ -448,8 +501,9 @@ class UpdateRunner:
             self.save()
         try:
             self.refresh_sources()
-            self.rebuild_routes()
-            dataset_dir = self.rebuild_outcomes()
+            rust_binary = self.build_rust_kernel()
+            self.rebuild_routes(rust_binary)
+            dataset_dir = self.rebuild_outcomes(rust_binary)
             self.retrain_risk_models(dataset_dir)
             self.retrain_frozen_forecast_v1(dataset_dir)
         except KeyboardInterrupt:

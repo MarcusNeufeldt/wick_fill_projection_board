@@ -33,7 +33,22 @@ class WickUpdateTests(unittest.TestCase):
                 slug = asset.lower()
                 self.assertIn(f"build_routes_1m_{slug}", command_stages)
                 self.assertIn(f"cache_routes_1m_{slug}", command_stages)
+            self.assertIn("build_rust_kernel", command_stages)
             self.assertIn("build_all_outcomes", command_stages)
+            outcome_command = next(
+                item["command"]
+                for item in runner.manifest["stages"]
+                if item["stage"] == "build_all_outcomes" and "command" in item
+            )
+            self.assertIn("--engine", outcome_command)
+            self.assertIn("rust", outcome_command)
+            route_commands = [
+                item["command"]
+                for item in runner.manifest["stages"]
+                if item["stage"].startswith("build_routes_") and "command" in item
+            ]
+            self.assertTrue(route_commands)
+            self.assertTrue(all("--engine" in command and "rust" in command for command in route_commands))
             self.assertIn("train_and_gate_risk_models", command_stages)
             self.assertIn("train_forecast_v1_candidate_5m", command_stages)
             candidate_event = next(

@@ -13,10 +13,35 @@ predictions and outcomes accumulate.
 | Additional adverse p80/p90 | A calibrated tail |
 | Waiting-time p10/p50/p90 | A supervised model |
 | Historical support | C2 dynamic weighted retrieval |
-| Projected candles | Separate real-historical illustration layer |
+| Projected candles | C2 real-historical candidates aligned to E0/A time-risk targets |
 
 Historical support is a familiarity/difficulty disclosure, not a probability
 or confidence percentage. It is not fed back into E0.
+
+## Route contract
+
+Adaptive 5m uses the same frozen artifact to retrieve distinct C2 historical
+episodes and then selects four drawable, completed historical suffixes:
+
+- Fast targets 1-day waiting-time p10 and adverse p50.
+- Normal targets 7-day waiting-time p50 and adverse p50.
+- Adverse first targets 1-day adverse p80 and requires a definite threshold
+  crossing before the terminal fill candle.
+- Extreme targets 30-day waiting-time p90 and adverse p90.
+
+The selector balances duration compatibility, projected adverse compatibility
+and C2 fingerprint distance. Adverse first deliberately gives most of its
+selection weight to adverse-size compatibility; Extreme continues to represent
+combined long-wait and p90-tail stress. Route adverse percentages use the
+observable entry close as their denominator, matching the numerical model.
+E0/A provide numerical targets; they do not
+generate candles. Every displayed route remains one rescaled real historical
+continuation, and is therefore an illustration rather than a route probability
+or calibrated full-path interval. If the frozen artifact or enough drawable C2
+episodes are unavailable, Adaptive retains the V1 routes and exposes the
+fallback reason. `Legacy V3 comparison` is opt-in and never silently replaces
+Adaptive Normal. The C2-aligned route contract is currently 5m-only; 1m
+Adaptive retains V1 until an equivalent 1m architecture is validated.
 
 ## Runtime
 
